@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Client UI - Telemetria</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    #charts { display:flex; gap:16px; flex-wrap:wrap }
+    canvas { background:#fff; border:1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <h2>Telemetria e Atuadores</h2>
+  <div id="charts">
+    <div>
+      <h4>Temperatura (últimos pontos)</h4>
+      <canvas id="tempChart" width="600" height="250"></canvas>
+    </div>
+    <div>
+      <h4>Atuadores (histórico simples)</h4>
+      <canvas id="actChart" width="600" height="250"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const tempCtx = document.getElementById('tempChart').getContext('2d');
+    const actCtx = document.getElementById('actChart').getContext('2d');
+
+    const tempChart = new Chart(tempCtx, {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: { animation:false, responsive:true, scales: { x:{ display:true }, y:{ beginAtZero:false } } }
+    });
+
+    const actChart = new Chart(actCtx, {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: { animation:false, responsive:true }
+    });
+
+    const maxPoints = 50;
+    const devices = {};
+
+    function ensureDevice(id) {
+      if (devices[id]) return devices[id];
+      devices[id] = { temps: [], acts: [], labels: [] };
+      // add dataset for temp
+      tempChart.data.datasets.push({ label: id, data: [], borderWidth:1, tension:0.2 });
+      // actuator dataset (as 0/1)
+      actChart.data.datasets.push({ label: id, data: [], borderWidth:1, tension:0.2 });
+      return devices[id];
+    }
+
+    function pushPoint(id, ts, temp, acts) {
+      const dev = ensureDevice(id);
+      const label = new Date(ts*1000).toLocaleTimeString();
+      dev.labels.push(label);
+      dev.temps.push(temp);
+      dev.acts.push(acts && acts.length? (acts[0]?1:0) : 0);
+      // trim
+      if (dev.labels.length > maxPoints) { dev.labels.shift(); dev.temps.shift(); dev.acts.shift(); }
+      // update charts dataset for this id
+      const idx = Object.keys(devices).indexOf(id);
+      // find index of dataset with label id
+      const tempDs = tempChart.data.datasets.find(d => d.label===id);
+      const actDs = actChart.data.datasets.find(d => d.label===id);
+      if (tempDs) { tempChart.data.labels = dev.labels; tempDs.data = dev.temps; }
+      if (actDs) { actChart.data.labels = dev.labels; actDs.data = dev.acts; }
+      tempChart.update(); actChart.update();
+    }
+
+    const evt = new EventSource('/events');
+    evt.onmessage = e => {
+      try {
+        const obj = JSON.parse(e.data);
+        if (obj.type === 'telemetry') {
+          pushPoint(obj.id, obj.time, obj.temp, null);
+        } else if (obj.type === 'stat') {
+          // stat may include states array
+          pushPoint(obj.id, obj.time, NaN, obj.states);
+        }
+      } catch(err) { console.error(err); }
+    };
+    evt.onerror = () => { console.warn('EventSource error'); };
+  </script>
+</body>
+</html>

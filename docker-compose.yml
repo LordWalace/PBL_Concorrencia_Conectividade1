@@ -1,0 +1,32 @@
+services:
+  gateway:
+    build: ./gateway
+    env_file: ./.env
+    container_name: gateway
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "8082:8082/udp"
+    networks:
+      - iot_net
+  device:
+    build: ./device
+    env_file: ./.env
+    container_name: device
+    ports:
+      - "8083:8083"
+    networks:
+      - iot_net
+  client:
+    build: ./client
+    env_file: ./.env
+    container_name: client
+    # start services individually; do not auto-start gateway
+    stdin_open: true
+    tty: true
+    networks:
+      - iot_net
+
+networks:
+  iot_net:
+    driver: bridge
