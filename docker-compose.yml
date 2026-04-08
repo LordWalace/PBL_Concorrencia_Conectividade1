@@ -12,7 +12,6 @@ services:
   device:
     build: ./device
     env_file: ./.env
-    container_name: device
     ports:
       - "8083:8083"
     networks:
@@ -20,7 +19,7 @@ services:
   client:
     build: ./client
     env_file: ./.env
-    container_name: client
+    # no fixed container_name so multiple client/device instances can be created
     # start services individually; do not auto-start gateway
     stdin_open: true
     tty: true

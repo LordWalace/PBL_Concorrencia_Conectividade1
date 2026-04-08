@@ -2,7 +2,8 @@
 param(
     [int]$Max = 50,
     [int]$Step = 5,
-    [int]$WaitSeconds = 10
+    [int]$WaitSeconds = 10,
+    [string]$BaseName = "device"
 )
 
 for ($n = $Step; $n -le $Max; $n += $Step) {
@@ -10,8 +11,8 @@ for ($n = $Step; $n -le $Max; $n += $Step) {
     docker-compose up -d --scale device=$n
     Write-Host "Aguardando $WaitSeconds segundos para estabilizar..."
     Start-Sleep -Seconds $WaitSeconds
-    Write-Host "Exibindo containers ativos (contar devices):"
-    docker ps --filter "name=device" --format "{{.Names}}"
+    Write-Host "Exibindo containers ativos (contar devices com prefixo $BaseName):"
+    docker ps --format "{{.Names}}" | Where-Object { $_ -like "$BaseName*" }
     Write-Host "Gateway logs (últimas linhas):"
     docker-compose logs --tail=20 gateway
 }

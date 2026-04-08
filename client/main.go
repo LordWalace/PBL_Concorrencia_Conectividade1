@@ -140,7 +140,7 @@ func main() {
 	// start connection manager
 	go func() {
 		connectAddr := net.JoinHostPort(gatewayHost, gwPort)
-		backoff := 1 * time.Second
+		retryInterval := 5 * time.Second
 		for {
 			pushNotif("tentando conectar ao gateway")
 			conn, err := net.Dial("tcp", connectAddr)
@@ -151,16 +151,11 @@ func main() {
 				conn, err = net.Dial("tcp", fallback)
 				if err != nil {
 					pushNotif("falha ao conectar ao gateway, tentando novamente...")
-					time.Sleep(backoff)
-					if backoff < 30*time.Second {
-						backoff *= 2
-					}
+					time.Sleep(retryInterval)
 					continue
 				}
 				connectAddr = fallback
 			}
-			// reset backoff
-			backoff = 1 * time.Second
 			// set global connection
 			connMu.Lock()
 			gwConn = conn
@@ -178,7 +173,7 @@ func main() {
 			}
 			connMu.Unlock()
 			pushNotif("desconectado do gateway, reconectando...")
-			time.Sleep(2 * time.Second)
+			time.Sleep(retryInterval)
 		}
 	}()
 
@@ -265,6 +260,20 @@ func main() {
 							continue
 						}
 						action := strings.ToLower(partsCmd[2])
+						// check offline
+						mu.Lock()
+						var dptr *DeviceInfo
+						for _, x := range latest {
+							if x.ID == id {
+								dptr = x
+								break
+							}
+						}
+						mu.Unlock()
+						if isDeviceOffline(dptr) {
+							fmt.Printf("[WARN] %s está offline — não é possível enviar comandos\n", id)
+							continue
+						}
 						if action == "on" {
 							if err := sendToGateway("%s|ACT2_ON\n", id); err != nil {
 								fmt.Printf("[ERR] envio falhou: %v\n", err)
@@ -295,6 +304,20 @@ func main() {
 							continue
 						}
 						action := strings.ToLower(partsCmd[2])
+						// check offline
+						mu.Lock()
+						var dptr *DeviceInfo
+						for _, x := range latest {
+							if x.ID == id {
+								dptr = x
+								break
+							}
+						}
+						mu.Unlock()
+						if isDeviceOffline(dptr) {
+							fmt.Printf("[WARN] %s está offline — não é possível enviar comandos\n", id)
+							continue
+						}
 						if action == "on" {
 							if err := sendToGateway("%s|FAN_ON\n", id); err != nil {
 								fmt.Printf("[ERR] envio falhou: %v\n", err)
@@ -331,10 +354,17 @@ func main() {
 						}
 						mu.Unlock()
 						if d != nil {
-							oneShotMu.Lock()
-							oneShot = fmt.Sprintf("Últimos atuadores de %s: %s", d.ID, formatActuators(d.Actuators))
-							oneShotUntil = time.Now().Add(6 * time.Second)
-							oneShotMu.Unlock()
+							if isDeviceOffline(d) {
+								oneShotMu.Lock()
+								oneShot = fmt.Sprintf("%s está offline — atuadores indisponíveis", d.ID)
+								oneShotUntil = time.Now().Add(6 * time.Second)
+								oneShotMu.Unlock()
+							} else {
+								oneShotMu.Lock()
+								oneShot = fmt.Sprintf("Últimos atuadores de %s: %s", d.ID, formatActuators(d.Actuators))
+								oneShotUntil = time.Now().Add(6 * time.Second)
+								oneShotMu.Unlock()
+							}
 						}
 						render()
 						continue
@@ -350,18 +380,39 @@ func main() {
 						}
 						mu.Unlock()
 						if d != nil {
-							oneShotMu.Lock()
-							oneShot = fmt.Sprintf("Últimos sensores de %s - Temp: %.2f, Mem: %.2f%%", d.ID, d.Temp, d.MemoryPct)
-							oneShotUntil = time.Now().Add(6 * time.Second)
-							oneShotMu.Unlock()
+							if isDeviceOffline(d) {
+								oneShotMu.Lock()
+								oneShot = fmt.Sprintf("%s está offline — sensores indisponíveis", d.ID)
+								oneShotUntil = time.Now().Add(6 * time.Second)
+								oneShotMu.Unlock()
+							} else {
+								oneShotMu.Lock()
+								oneShot = fmt.Sprintf("Últimos sensores de %s - Temp: %.2f, Mem: %.2f%%", d.ID, d.Temp, d.MemoryPct)
+								oneShotUntil = time.Now().Add(6 * time.Second)
+								oneShotMu.Unlock()
+							}
 						}
 						render()
 						continue
 					case "clean":
-						if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
-							fmt.Printf("[ERR] envio falhou: %v\n", err)
+						// check offline before clean
+						mu.Lock()
+						var dptr *DeviceInfo
+						for _, x := range latest {
+							if x.ID == id {
+								dptr = x
+								break
+							}
+						}
+						mu.Unlock()
+						if isDeviceOffline(dptr) {
+							fmt.Printf("[WARN] %s está offline — não é possível limpar memória\n", id)
 						} else {
-							fmt.Printf("[LOG] CLEAN_MEM enviado para: %s\n", id)
+							if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
+								fmt.Printf("[ERR] envio falhou: %v\n", err)
+							} else {
+								fmt.Printf("[LOG] CLEAN_MEM enviado para: %s\n", id)
+							}
 						}
 						oneShotMu.Lock()
 						oneShot = fmt.Sprintf("✓ Limpeza de memória solicitada para %s", id)
@@ -553,7 +604,14 @@ func main() {
 								if deviceInfo != nil {
 									fanOn = deviceInfo.FanOn
 								}
-								if fanOn {
+								// prevent control if device offline
+								if isDeviceOffline(deviceInfo) {
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("%s está offline — não é possível controlar atuadores", id)
+									oneShotUntil = time.Now().Add(4 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else if fanOn {
 									if err := sendToGateway("%s|FAN_OFF\n", id); err != nil {
 										fmt.Printf("[ERR] envio falhou: %v\n", err)
 									} else {
@@ -582,7 +640,14 @@ func main() {
 								if deviceInfo != nil && len(deviceInfo.Actuators) >= 2 {
 									ledOn = deviceInfo.Actuators[1]
 								}
-								if ledOn {
+								// prevent control if device offline
+								if isDeviceOffline(deviceInfo) {
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("%s está offline — não é possível controlar atuadores", id)
+									oneShotUntil = time.Now().Add(4 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else if ledOn {
 									if err := sendToGateway("%s|ACT2_OFF\n", id); err != nil {
 										fmt.Printf("[ERR] envio falhou: %v\n", err)
 									} else {
@@ -639,18 +704,60 @@ func main() {
 								render()
 							} else if act == 6 {
 								// clean memory for selected device
-								if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
-									fmt.Printf("[ERR] envio falhou: %v\n", err)
+								if isDeviceOffline(deviceInfo) {
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("%s está offline — não é possível limpar memória", id)
+									oneShotUntil = time.Now().Add(4 * time.Second)
+									oneShotMu.Unlock()
 								} else {
-									fmt.Printf("[LOG] CLEAN_MEM enviado para: %s (via menu)\n", id)
+									if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] CLEAN_MEM enviado para: %s (via menu)\n", id)
+									}
 								}
 								oneShotMu.Lock()
 								oneShot = fmt.Sprintf("✓ Limpeza de memória solicitada para %s", id)
 								oneShotUntil = time.Now().Add(3 * time.Second)
 								oneShotMu.Unlock()
 								render()
+
+								// action 8: toggle POWER (actuator 3)
+							} else if act == 8 {
+								powerOn := false
+								if deviceInfo != nil && len(deviceInfo.Actuators) >= 3 {
+									powerOn = deviceInfo.Actuators[2]
+								}
+								if isDeviceOffline(deviceInfo) {
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("%s está offline — não é possível controlar POWER", id)
+									oneShotUntil = time.Now().Add(4 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else if powerOn {
+									if err := sendToGateway("%s|ACT3_OFF\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] POWER OFF enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ POWER desligado para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else {
+									if err := sendToGateway("%s|ACT3_ON\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] POWER ON enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ POWER ligado para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								}
 							}
-							continue
 							continue
 						case 7:
 							// close menu
@@ -663,6 +770,9 @@ func main() {
 							// unknown action number
 						}
 					}
+
+					// new: 8 = toggle POWER (actuator 3) for selected device
+					// handled above inside the action cases
 				}
 			}
 
@@ -932,15 +1042,19 @@ func render() {
 			}
 		}
 		if sel != nil {
-			led := "OFF"
-			if len(sel.Actuators) > 1 && sel.Actuators[1] {
-				led = "ON"
+			if isDeviceOffline(sel) {
+				b.WriteString(fmt.Sprintf("[DEVICE %s] OFFLINE — sem dados recentes (último visto: %s)\n", sel.ID, sel.LastSeen.Format("15:04:05")))
+			} else {
+				led := "OFF"
+				if len(sel.Actuators) > 1 && sel.Actuators[1] {
+					led = "ON"
+				}
+				fan := "OFF"
+				if sel.FanOn {
+					fan = "ON"
+				}
+				b.WriteString(fmt.Sprintf("[DEVICE %s] Temp: %.2f°C  Mem: %.2f%%  Fan:%s  LED (%s)\n", sel.ID, sel.Temp, sel.MemoryPct, fan, led))
 			}
-			fan := "OFF"
-			if sel.FanOn {
-				fan = "ON"
-			}
-			b.WriteString(fmt.Sprintf("[DEVICE %s] Temp: %.2f°C  Mem: %.2f%%  Fan:%s  LED (%s)\n", sel.ID, sel.Temp, sel.MemoryPct, fan, led))
 		} else {
 			b.WriteString(fmt.Sprintf("[DEVICE %s] sem dados recentes\n", selectedID))
 		}
@@ -966,6 +1080,7 @@ func render() {
 		b.WriteString("  5) Ver sensores do dispositivo (ex: 5 1)\n")
 		b.WriteString("  6) Limpar memória (ex: 6 1)\n")
 		b.WriteString("  7) Fechar este menu\n")
+		b.WriteString("  8) Alternar POWER (liga/desliga GPU) (ex: 8 1)\n")
 
 		// list devices with numbers for quick selection
 		b.WriteString(" Dispositivos registrados:\n")

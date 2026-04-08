@@ -8,6 +8,10 @@ while ($count -le 0) {
     Write-Host "Valor inválido. Digite um número inteiro maior que 0." -ForegroundColor Yellow
 }
 
+$baseNameInput = Read-Host 'Prefixo para nome dos devices (default: device)'
+[string]$BaseName = 'device'
+if (-not [string]::IsNullOrWhiteSpace($baseNameInput)) { $BaseName = $baseNameInput }
+
 $samplesInput = Read-Host 'Quantas amostras deseja coletar? (default 12)'
 [int]$samples = 12
 if ($samplesInput -ne '') { [int]::TryParse($samplesInput,[ref]$samples) | Out-Null }
@@ -16,7 +20,7 @@ $intervalInput = Read-Host 'Intervalo entre amostras em segundos? (default 5)'
 [int]$interval = 5
 if ($intervalInput -ne '') { [int]::TryParse($intervalInput,[ref]$interval) | Out-Null }
 
-Write-Host "Iniciando gateway, escalando $count devices e iniciando client..."
+Write-Host "Iniciando gateway, escalando $count devices com prefixo $BaseName e iniciando client..."
 docker-compose up -d gateway
 docker-compose up -d --scale device=$count
 docker-compose up -d client
@@ -31,8 +35,8 @@ $outFile = "scripts/scale_metrics_$ts.csv"
 
 for ($i=1; $i -le $samples; $i++) {
     $now = Get-Date -Format o
-    # contar containers de device (nome contém 'device')
-    $devCount = (docker ps --filter "name=device" --format "{{.Names}}" | Measure-Object).Count
+    # contar containers de device pelo prefixo
+    $devCount = (docker ps --format "{{.Names}}" | Where-Object { $_ -like "$BaseName*" } | Measure-Object).Count
 
     # coletar estatísticas do gateway
     $stat = docker stats gateway --no-stream --format "{{.CPUPerc}},{{.MemUsage}},{{.NetIO}}" 2>$null

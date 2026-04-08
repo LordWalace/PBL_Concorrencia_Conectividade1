@@ -1,6 +1,6 @@
 # Inicia gateway, escala devices (padrão 3) e inicia client; abre terminais de logs
 param(
-    [int]$DeviceCount = 3
+    [int]$DeviceCount = 2
 )
 
 docker-compose up -d gateway

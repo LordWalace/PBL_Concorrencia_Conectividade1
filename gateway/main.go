@@ -34,10 +34,16 @@ type Telemetry struct {
 	FanOn bool    `json:"fan_on"`
 }
 
+// clientEntry stores a client's message channel and remote address
+type clientEntry struct {
+	ch   chan string
+	addr string
+}
+
 var (
 	devices        = make(map[string]*DeviceInfo)
 	mu             sync.Mutex
-	clientChannels = make(map[int]chan string)
+	clientChannels = make(map[int]clientEntry)
 	clientMu       sync.Mutex
 	clientCounter  int
 )
@@ -277,13 +283,16 @@ func handleClientConn(conn net.Conn) {
 	clientCounter++
 	myID := clientCounter
 	ch := make(chan string, 10)
-	clientChannels[myID] = ch
+	clientChannels[myID] = clientEntry{ch: ch, addr: conn.RemoteAddr().String()}
 	clientMu.Unlock()
 	log.Printf("[CLIENT %d] conectado: %s", myID, conn.RemoteAddr().String())
 	defer func() {
 		clientMu.Lock()
-		delete(clientChannels, myID)
-		close(ch)
+		// close and remove
+		if e, ok := clientChannels[myID]; ok {
+			close(e.ch)
+			delete(clientChannels, myID)
+		}
 		clientMu.Unlock()
 		conn.Close()
 		log.Printf("[CLIENT %d] desconectado", myID)
@@ -338,7 +347,7 @@ func sendCommandToDevice(id, cmd string) {
 		return
 	}
 	addr := fmt.Sprintf("%s:%d", d.IP, d.Port)
-	log.Printf("[DEVICE %s] tentando conectar em %s para enviar: %s", id, addr, cmd)
+	log.Printf("[DEVICE %s] Tentando conectar em %s para enviar: %s", id, addr, cmd)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		log.Printf("failed to connect to device %s at %s: %v", id, addr, err)
@@ -362,9 +371,9 @@ func sendCommandToDevice(id, cmd string) {
 func sendToAllClients(msg string) {
 	clientMu.Lock()
 	defer clientMu.Unlock()
-	for _, ch := range clientChannels {
+	for _, entry := range clientChannels {
 		select {
-		case ch <- msg:
+		case entry.ch <- msg:
 		default:
 			// drop if client channel full
 		}
@@ -403,7 +412,21 @@ func statusReporter() {
 		mu.Unlock()
 
 		clientMu.Lock()
-		sb.WriteString(fmt.Sprintf("Connected clients: %d\n", len(clientChannels)))
+		// count unique remote addresses for transparency
+		unique := make(map[string]struct{})
+		for _, e := range clientChannels {
+			if e.addr != "" {
+				unique[e.addr] = struct{}{}
+			}
+		}
+		sb.WriteString(fmt.Sprintf("Connected clients (channels): %d\n", len(clientChannels)))
+		sb.WriteString(fmt.Sprintf("Connected clients (unique addrs): %d\n", len(unique)))
+		if len(clientChannels) > 0 {
+			sb.WriteString("Clients detail:\n")
+			for id, e := range clientChannels {
+				sb.WriteString(fmt.Sprintf("  id=%d addr=%s\n", id, e.addr))
+			}
+		}
 		clientMu.Unlock()
 
 		log.Print(sb.String())

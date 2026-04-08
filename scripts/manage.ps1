@@ -25,6 +25,8 @@ while ($true) {
     Write-Host "7) Logs client (attach)"
     Write-Host "8) Scale devices (escolher quantidade)"
     Write-Host "9) Stop all"
+    Write-Host "10) Spawn 10 devices (GPU_1..GPU_10)"
+    Write-Host "11) Spawn 500 devices (teste de carga)"
     Write-Host "0) Exit"
     $choice = Read-Host 'Selecione uma opção (0-9)'
     switch ($choice) {
@@ -53,6 +55,18 @@ while ($true) {
             $dc = Read-Host 'Quantos devices (para scale)?'
             if (-not [int]::TryParse($dc,[ref]$null)) { Write-Host 'Valor inválido'; Start-Sleep -Seconds 1; continue }
             Scale-Devices([int]$dc)
+            Read-Host 'Pressione Enter para voltar ao menu.'
+        }
+        '10' {
+            Write-Host 'Criando 10 devices com nomes GPU_1..GPU_10 (usando scripts/spawn_devices.ps1)...'
+            & .\scripts\spawn_devices.ps1 -Count 10 -BaseName GPU -StartPort 6001
+            Write-Host 'Spawn solicitado. Verifique com docker ps.'
+            Read-Host 'Pressione Enter para voltar ao menu.'
+        }
+        '11' {
+            Write-Host 'Iniciando teste de carga: 500 devices (scripts/test_500_devices.ps1)...'
+            & .\scripts\test_500_devices.ps1 -Count 500 -BaseName GPU -StartPort 6001
+            Write-Host 'Spawn 500 solicitado. Aguarde e verifique com docker ps.'
             Read-Host 'Pressione Enter para voltar ao menu.'
         }
         '9' { docker-compose down --remove-orphans; Read-Host 'Containers parados. Pressione Enter.' }
