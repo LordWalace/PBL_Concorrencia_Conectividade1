@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -43,6 +44,9 @@ var (
 	oneShot      string
 	oneShotUntil time.Time
 	lastScreen   string
+	selectedID   string
+	// gateway connection (protected by connMu)
+	gwConn net.Conn
 )
 
 // resolveIndex aceita índices 0-based ou 1-based e retorna o índice resolvido (0-based).
@@ -85,46 +89,100 @@ const (
 	colorRed    = "\033[31m"
 	colorGreen  = "\033[32m"
 	colorCyan   = "\033[36m"
+	// smoothing factor for telemetry (EMA). Lower -> slower changes.
+	tempAlpha = 0.25
+	memAlpha  = 0.25
+	// consider device offline if no updates within this duration
+	offlineTimeout = 15 * time.Second
 )
 
+// isDeviceOffline returns true if device has no recent LastSeen timestamp
+func isDeviceOffline(d *DeviceInfo) bool {
+	if d == nil {
+		return true
+	}
+	if d.LastSeen.IsZero() {
+		return true
+	}
+	return time.Since(d.LastSeen) > offlineTimeout
+}
+
+// formatActuators returns a human-friendly string for a slice of actuator states.
+func formatActuators(acts []bool) string {
+	if acts == nil || len(acts) == 0 {
+		return "[]"
+	}
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i, a := range acts {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		if a {
+			sb.WriteString(fmt.Sprintf("A%d:ON", i+1))
+		} else {
+			sb.WriteString(fmt.Sprintf("A%d:OFF", i+1))
+		}
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
+
 func main() {
-	// Try connecting to Docker hostname first (works when client runs in container)
+	// gateway host/port
 	gatewayHost := getenv("GATEWAY_HOST", "gateway")
 	// use GATEWAY_TCP_PORT with default 8080
 	gwPort := getenv("GATEWAY_TCP_PORT", "8080")
-	// notify trying to connect
-	pushNotif("tentando conectar ao gateway")
-	addr := net.JoinHostPort(gatewayHost, gwPort)
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		// fallback to GATEWAY_IP (useful when running client locally)
-		gwIP := getenv("GATEWAY_IP", getenv("IP_REAL", "127.0.0.1"))
-		fallbackAddr := net.JoinHostPort(gwIP, gwPort)
-		conn, err = net.Dial("tcp", fallbackAddr)
-		if err != nil {
-			// cannot connect to gateway, exit
-			return
-		}
-		addr = fallbackAddr
-	}
-	pushNotif("conectado ao gateway")
-	defer conn.Close()
 
 	// channel to receive stdin lines (reader goroutine pushes into this)
 	inputCh := make(chan string, 10)
 
-	// mark connected
-	connMu.Lock()
-	connected = true
-	connMu.Unlock()
-	// start gateway reader in background
+	// start connection manager
 	go func() {
-		readGateway(conn)
-		connMu.Lock()
-		connected = false
-		connMu.Unlock()
-		pushNotif("desconectado do gateway")
+		connectAddr := net.JoinHostPort(gatewayHost, gwPort)
+		backoff := 1 * time.Second
+		for {
+			pushNotif("tentando conectar ao gateway")
+			conn, err := net.Dial("tcp", connectAddr)
+			if err != nil {
+				// try fallback GATEWAY_IP
+				gwIP := getenv("GATEWAY_IP", getenv("IP_REAL", "127.0.0.1"))
+				fallback := net.JoinHostPort(gwIP, gwPort)
+				conn, err = net.Dial("tcp", fallback)
+				if err != nil {
+					pushNotif("falha ao conectar ao gateway, tentando novamente...")
+					time.Sleep(backoff)
+					if backoff < 30*time.Second {
+						backoff *= 2
+					}
+					continue
+				}
+				connectAddr = fallback
+			}
+			// reset backoff
+			backoff = 1 * time.Second
+			// set global connection
+			connMu.Lock()
+			gwConn = conn
+			connected = true
+			connMu.Unlock()
+			pushNotif("conectado ao gateway")
+			// block reading until connection ends
+			readGateway(conn)
+			// readGateway returned -> connection lost
+			connMu.Lock()
+			connected = false
+			if gwConn != nil {
+				gwConn.Close()
+				gwConn = nil
+			}
+			connMu.Unlock()
+			pushNotif("desconectado do gateway, reconectando...")
+			time.Sleep(2 * time.Second)
+		}
 	}()
+
+	// connection manager handles connecting and reading from gateway
 
 	// start simple HTTP server to serve UI and SSE events
 	uiPort := getenv("CLIENT_UI_PORT", "9000")
@@ -142,173 +200,325 @@ func main() {
 		}
 	}(inputCh)
 
-	// main loop: limpa tela, desenha e processa teclado
+	// desenho inicial
+	render()
+
+	// main loop: processa teclado e atualiza tela apenas quando houver comando
 	for {
-		// clear screen
-		fmt.Print("\033[H\033[2J")
-		render()
-
-		// non-blocking input processing: expect single number to toggle, or Q to quit
-		select {
-		case ln := <-inputCh:
-			if ln == "" {
-				// empty Enter: open menu for convenience in TTYs where typing may be hidden
-				menuMu.Lock()
-				showMenu = true
-				menuUntil = time.Time{}
-				menuMu.Unlock()
-				continue
-			} else {
-				if strings.EqualFold(ln, "q") {
-					return
+		ln := <-inputCh
+		if ln == "" {
+			// empty Enter: open menu for convenience in TTYs where typing may be hidden
+			menuMu.Lock()
+			showMenu = true
+			menuUntil = time.Time{}
+			menuMu.Unlock()
+			render()
+			continue
+		} else {
+			if strings.EqualFold(ln, "q") {
+				return
+			}
+			// menu commands: help/menu, led <index> on|off, fan <index> on|off, actuators <index>, sensors <index>, clean <index>
+			partsCmd := strings.Fields(ln)
+			if len(partsCmd) > 0 {
+				cmd := strings.ToLower(partsCmd[0])
+				if cmd == "help" || cmd == "menu" {
+					// show menu overlay until user closes it
+					menuMu.Lock()
+					showMenu = true
+					menuUntil = time.Time{}
+					menuMu.Unlock()
+					continue
 				}
-				// menu commands: help/menu, led <index> on|off, fan <index> on|off, actuators <index>, sensors <index>, clean <index>
-				partsCmd := strings.Fields(ln)
-				if len(partsCmd) > 0 {
-					cmd := strings.ToLower(partsCmd[0])
-					if cmd == "help" || cmd == "menu" {
-						// show menu overlay until user closes it
-						menuMu.Lock()
-						showMenu = true
-						menuUntil = time.Time{}
-						menuMu.Unlock()
+				if cmd == "close" || cmd == "hide" {
+					menuMu.Lock()
+					showMenu = false
+					menuMu.Unlock()
+					continue
+				}
+				if cmd == "led" || cmd == "fan" || cmd == "actuators" || cmd == "sensors" || cmd == "clean" {
+					// require index
+					if len(partsCmd) < 2 {
+						fmt.Println("use: " + cmd + " <index> [on|off]")
 						continue
 					}
-					if cmd == "close" || cmd == "hide" {
-						menuMu.Lock()
-						showMenu = false
-						menuMu.Unlock()
+					idxRaw, err := strconv.Atoi(partsCmd[1])
+					if err != nil {
+						fmt.Println("indice invalido")
 						continue
 					}
-					if cmd == "led" || cmd == "fan" || cmd == "actuators" || cmd == "sensors" || cmd == "clean" {
-						// require index
-						if len(partsCmd) < 2 {
-							fmt.Println("use: " + cmd + " <index> [on|off]")
-							continue
-						}
-						idxRaw, err := strconv.Atoi(partsCmd[1])
-						if err != nil {
-							fmt.Println("indice invalido")
-							continue
-						}
-						mu.Lock()
-						resolved, ok := resolveIndex(idxRaw, len(latest))
-						if !ok {
-							mu.Unlock()
-							fmt.Println("indice invalido")
-							continue
-						}
-						id := latest[resolved].ID
+					mu.Lock()
+					resolved, ok := resolveIndex(idxRaw, len(latest))
+					if !ok {
 						mu.Unlock()
-						switch cmd {
-						case "led":
-							if len(partsCmd) < 3 {
-								fmt.Println("use: led <index> on|off")
-								continue
-							}
-							action := strings.ToLower(partsCmd[2])
-							if action == "on" {
-								fmt.Fprintf(conn, "%s|ACT2_ON\n", id)
-							} else {
-								fmt.Fprintf(conn, "%s|ACT2_OFF\n", id)
-							}
-							continue
-						case "fan":
-							if len(partsCmd) < 3 {
-								fmt.Println("use: fan <index> on|off")
-								continue
-							}
-							action := strings.ToLower(partsCmd[2])
-							if action == "on" {
-								fmt.Fprintf(conn, "%s|FAN_ON\n", id)
-							} else {
-								fmt.Fprintf(conn, "%s|FAN_OFF\n", id)
-							}
-							continue
-						case "actuators":
-							// find device by id and show actuators
-							mu.Lock()
-							var d *DeviceInfo
-							for _, x := range latest {
-								if x.ID == id {
-									d = x
-									break
-								}
-							}
-							mu.Unlock()
-							if d != nil {
-								oneShotMu.Lock()
-								oneShot = fmt.Sprintf("Últimos atuadores de %s: %v", d.ID, d.Actuators)
-								oneShotUntil = time.Now().Add(6 * time.Second)
-								oneShotMu.Unlock()
-							}
-							continue
-						case "sensors":
-							// find device by id and show sensors
-							mu.Lock()
-							var d *DeviceInfo
-							for _, x := range latest {
-								if x.ID == id {
-									d = x
-									break
-								}
-							}
-							mu.Unlock()
-							if d != nil {
-								oneShotMu.Lock()
-								oneShot = fmt.Sprintf("Últimos sensores de %s - Temp: %.2f, Mem: %.2f%%", d.ID, d.Temp, d.MemoryPct)
-								oneShotUntil = time.Now().Add(6 * time.Second)
-								oneShotMu.Unlock()
-							}
-							continue
-						case "clean":
-							fmt.Fprintf(conn, "%s|CLEAN_MEM\n", id)
+						fmt.Println("indice invalido")
+						render()
+						continue
+					}
+					id := latest[resolved].ID
+					selectedID = id
+					mu.Unlock()
+					switch cmd {
+					case "led":
+						if len(partsCmd) < 3 {
+							fmt.Println("use: led <index> on|off")
 							continue
 						}
+						action := strings.ToLower(partsCmd[2])
+						if action == "on" {
+							if err := sendToGateway("%s|ACT2_ON\n", id); err != nil {
+								fmt.Printf("[ERR] envio falhou: %v\n", err)
+							} else {
+								fmt.Printf("[LOG] LED ON enviado para: %s\n", id)
+							}
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("✓ LED ON enviado para %s", id)
+							oneShotUntil = time.Now().Add(3 * time.Second)
+							oneShotMu.Unlock()
+							render()
+						} else {
+							if err := sendToGateway("%s|ACT2_OFF\n", id); err != nil {
+								fmt.Printf("[ERR] envio falhou: %v\n", err)
+							} else {
+								fmt.Printf("[LOG] LED OFF enviado para: %s\n", id)
+							}
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("✓ LED OFF enviado para %s", id)
+							oneShotUntil = time.Now().Add(3 * time.Second)
+							oneShotMu.Unlock()
+							render()
+						}
+						continue
+					case "fan":
+						if len(partsCmd) < 3 {
+							fmt.Println("use: fan <index> on|off")
+							continue
+						}
+						action := strings.ToLower(partsCmd[2])
+						if action == "on" {
+							if err := sendToGateway("%s|FAN_ON\n", id); err != nil {
+								fmt.Printf("[ERR] envio falhou: %v\n", err)
+							} else {
+								fmt.Printf("[LOG] FAN ON enviado para: %s\n", id)
+							}
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("✓ Ventoinha ligada para %s", id)
+							oneShotUntil = time.Now().Add(3 * time.Second)
+							oneShotMu.Unlock()
+							render()
+						} else {
+							if err := sendToGateway("%s|FAN_OFF\n", id); err != nil {
+								fmt.Printf("[ERR] envio falhou: %v\n", err)
+							} else {
+								fmt.Printf("[LOG] FAN OFF enviado para: %s\n", id)
+							}
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("✓ Ventoinha desligada para %s", id)
+							oneShotUntil = time.Now().Add(3 * time.Second)
+							oneShotMu.Unlock()
+							render()
+						}
+						continue
+					case "actuators":
+						// find device by id and show actuators
+						mu.Lock()
+						var d *DeviceInfo
+						for _, x := range latest {
+							if x.ID == id {
+								d = x
+								break
+							}
+						}
+						mu.Unlock()
+						if d != nil {
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("Últimos atuadores de %s: %s", d.ID, formatActuators(d.Actuators))
+							oneShotUntil = time.Now().Add(6 * time.Second)
+							oneShotMu.Unlock()
+						}
+						render()
+						continue
+					case "sensors":
+						// find device by id and show sensors
+						mu.Lock()
+						var d *DeviceInfo
+						for _, x := range latest {
+							if x.ID == id {
+								d = x
+								break
+							}
+						}
+						mu.Unlock()
+						if d != nil {
+							oneShotMu.Lock()
+							oneShot = fmt.Sprintf("Últimos sensores de %s - Temp: %.2f, Mem: %.2f%%", d.ID, d.Temp, d.MemoryPct)
+							oneShotUntil = time.Now().Add(6 * time.Second)
+							oneShotMu.Unlock()
+						}
+						render()
+						continue
+					case "clean":
+						if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
+							fmt.Printf("[ERR] envio falhou: %v\n", err)
+						} else {
+							fmt.Printf("[LOG] CLEAN_MEM enviado para: %s\n", id)
+						}
+						oneShotMu.Lock()
+						oneShot = fmt.Sprintf("✓ Limpeza de memória solicitada para %s", id)
+						oneShotUntil = time.Now().Add(3 * time.Second)
+						oneShotMu.Unlock()
+						render()
+						continue
 					}
 				}
-				// if menu is open, interpret a single numeric press as "show sensors" for that index
-				menuMu.Lock()
-				menuOpen := showMenu
-				menuMu.Unlock()
+			}
+			// if menu is open, interpret a single numeric press as "show sensors" for that index
+			menuMu.Lock()
+			menuOpen := showMenu
+			menuMu.Unlock()
 
-				if menuOpen {
-					parts := strings.Fields(ln)
-					if len(parts) > 0 {
-						if act, err := strconv.Atoi(parts[0]); err == nil {
-							switch act {
-							case 0:
-								return
-							case 1:
-								// show all devices values
+			if menuOpen {
+				parts := strings.Fields(ln)
+				if len(parts) > 0 {
+					if act, err := strconv.Atoi(parts[0]); err == nil {
+						switch act {
+						case 0:
+							return
+						case 1:
+							// show all devices values
+							mu.Lock()
+							if len(latest) == 0 {
+								mu.Unlock()
+								oneShotMu.Lock()
+								oneShot = "Nenhum dispositivo disponível"
+								oneShotUntil = time.Now().Add(4 * time.Second)
+								oneShotMu.Unlock()
+								render()
+							} else {
+								var b strings.Builder
+								for i, d := range latest {
+									if isDeviceOffline(d) {
+										b.WriteString(fmt.Sprintf("%d) %s - OFFLINE\n", i+1, d.ID))
+									} else {
+										b.WriteString(fmt.Sprintf("%d) %s - Temp: %.2f, Mem: %.2f%%, Atuadores: %s\n", i+1, d.ID, d.Temp, d.MemoryPct, formatActuators(d.Actuators)))
+									}
+								}
+								if len(latest) > 0 {
+									selectedID = latest[0].ID
+								}
+								mu.Unlock()
+								oneShotMu.Lock()
+								oneShot = b.String()
+								oneShotUntil = time.Now().Add(8 * time.Second)
+								oneShotMu.Unlock()
+								render()
+							}
+							continue
+						case 2, 3, 4, 5, 6:
+							// behavior:
+							// - 2: toggle FAN for selected device (or first) when no index
+							// - 3: toggle LED for selected device (or first) when no index
+							// - 4: show actuators for all devices when no index, or single device if index provided
+							// - 5: show sensors for all devices when no index, or single device if index provided
+							// - 6: clean memory for selected device (or index if provided)
+							var resolved int
+							var id string
+							var deviceInfo *DeviceInfo
+							// helpers to resolve by index or selectedID
+							resolveSelected := func() (int, string, bool) {
 								mu.Lock()
+								defer mu.Unlock()
+								if selectedID == "" {
+									if len(latest) == 0 {
+										return 0, "", false
+									}
+									return 0, latest[0].ID, true
+								}
+								for i, x := range latest {
+									if x.ID == selectedID {
+										return i, x.ID, true
+									}
+								}
 								if len(latest) == 0 {
-									mu.Unlock()
-									oneShotMu.Lock()
-									oneShot = "Nenhum dispositivo disponível"
-									oneShotUntil = time.Now().Add(4 * time.Second)
-									oneShotMu.Unlock()
-								} else {
+									return 0, "", false
+								}
+								return 0, latest[0].ID, true
+							}
+
+							// Case 4 and 5: show all when no index
+							if act == 4 {
+								if len(parts) < 2 {
+									// show actuators for all devices
+									mu.Lock()
+									if len(latest) == 0 {
+										mu.Unlock()
+										oneShotMu.Lock()
+										oneShot = "Nenhum dispositivo encontrado"
+										oneShotUntil = time.Now().Add(4 * time.Second)
+										oneShotMu.Unlock()
+										continue
+									}
 									var sb strings.Builder
 									for i, d := range latest {
-										sb.WriteString(fmt.Sprintf("%d) %s - Temp: %.2f, Mem: %.2f%%, Atuadores: %v\n", i+1, d.ID, d.Temp, d.MemoryPct, d.Actuators))
+										if isDeviceOffline(d) {
+											sb.WriteString(fmt.Sprintf("%d) %s - Atuadores: OFFLINE\n", i+1, d.ID))
+										} else {
+											sb.WriteString(fmt.Sprintf("%d) %s - Atuadores: %s\n", i+1, d.ID, formatActuators(d.Actuators)))
+										}
 									}
 									mu.Unlock()
 									oneShotMu.Lock()
 									oneShot = sb.String()
 									oneShotUntil = time.Now().Add(8 * time.Second)
 									oneShotMu.Unlock()
+									render()
+									continue
 								}
-								continue
-							case 2, 3, 4:
-								// require device index as second token
+							}
+							if act == 5 {
 								if len(parts) < 2 {
+									// show sensors for all devices
+									mu.Lock()
+									if len(latest) == 0 {
+										mu.Unlock()
+										oneShotMu.Lock()
+										oneShot = "Nenhum dispositivo encontrado"
+										oneShotUntil = time.Now().Add(4 * time.Second)
+										oneShotMu.Unlock()
+										continue
+									}
+									var sb strings.Builder
+									for i, d := range latest {
+										if isDeviceOffline(d) {
+											sb.WriteString(fmt.Sprintf("%d) %s - SENSORES OFFLINE\n", i+1, d.ID))
+										} else {
+											sb.WriteString(fmt.Sprintf("%d) %s - Temp: %.2f°C, Mem: %.2f%%\n", i+1, d.ID, d.Temp, d.MemoryPct))
+										}
+									}
+									mu.Unlock()
 									oneShotMu.Lock()
-									oneShot = "use: <acao> <device_index> (ex: 2 1)"
+									oneShot = sb.String()
+									oneShotUntil = time.Now().Add(8 * time.Second)
+									oneShotMu.Unlock()
+									render()
+									continue
+								}
+							}
+
+							// For actions that require a target device (2,3,6) or when index provided for 4,5
+							if len(parts) < 2 {
+								// use selected device
+								idx, sid, ok := resolveSelected()
+								if !ok {
+									oneShotMu.Lock()
+									oneShot = "Nenhum dispositivo disponível"
 									oneShotUntil = time.Now().Add(4 * time.Second)
 									oneShotMu.Unlock()
 									continue
 								}
+								resolved = idx
+								id = sid
+							} else {
 								idxRaw, err := strconv.Atoi(parts[1])
 								if err != nil {
 									oneShotMu.Lock()
@@ -318,7 +528,7 @@ func main() {
 									continue
 								}
 								mu.Lock()
-								resolved, ok := resolveIndex(idxRaw, len(latest))
+								r, ok := resolveIndex(idxRaw, len(latest))
 								if !ok {
 									mu.Unlock()
 									oneShotMu.Lock()
@@ -327,74 +537,137 @@ func main() {
 									oneShotMu.Unlock()
 									continue
 								}
-								id := latest[resolved].ID
-								fanOn := latest[resolved].FanOn
+								resolved = r
+								id = latest[resolved].ID
+								selectedID = id
 								mu.Unlock()
-								if act == 2 {
-									if fanOn {
-										fmt.Fprintf(conn, "%s|FAN_OFF\n", id)
-										oneShotMu.Lock()
-										oneShot = fmt.Sprintf("Enviado FAN_OFF para %s", id)
-										oneShotUntil = time.Now().Add(4 * time.Second)
-										oneShotMu.Unlock()
-									} else {
-										fmt.Fprintf(conn, "%s|FAN_ON\n", id)
-										oneShotMu.Lock()
-										oneShot = fmt.Sprintf("Enviado FAN_ON para %s", id)
-										oneShotUntil = time.Now().Add(4 * time.Second)
-										oneShotMu.Unlock()
-									}
-								} else if act == 3 {
-									// toggle LED (actuator 2)
-									mu.Lock()
-									var d *DeviceInfo
-									for _, x := range latest {
-										if x.ID == id {
-											d = x
-											break
-										}
-									}
-									mu.Unlock()
-									ledOn := false
-									if d != nil && len(d.Actuators) >= 2 {
-										ledOn = d.Actuators[1]
-									}
-									if ledOn {
-										fmt.Fprintf(conn, "%s|ACT2_OFF\n", id)
-										oneShotMu.Lock()
-										oneShot = fmt.Sprintf("Enviado ACT2_OFF para %s", id)
-										oneShotUntil = time.Now().Add(4 * time.Second)
-										oneShotMu.Unlock()
-									} else {
-										fmt.Fprintf(conn, "%s|ACT2_ON\n", id)
-										oneShotMu.Lock()
-										oneShot = fmt.Sprintf("Enviado ACT2_ON para %s", id)
-										oneShotUntil = time.Now().Add(4 * time.Second)
-										oneShotMu.Unlock()
-									}
-								} else if act == 4 {
-									fmt.Fprintf(conn, "%s|CLEAN_MEM\n", id)
-									oneShotMu.Lock()
-									oneShot = fmt.Sprintf("Enviado CLEAN_MEM para %s", id)
-									oneShotUntil = time.Now().Add(4 * time.Second)
-									oneShotMu.Unlock()
-								}
-								continue
-							default:
-								// unknown action number
 							}
+
+							mu.Lock()
+							deviceInfo = latest[resolved]
+							mu.Unlock()
+
+							if act == 2 {
+								// toggle FAN
+								fanOn := false
+								if deviceInfo != nil {
+									fanOn = deviceInfo.FanOn
+								}
+								if fanOn {
+									if err := sendToGateway("%s|FAN_OFF\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] FAN OFF enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ Ventoinha desligada para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else {
+									if err := sendToGateway("%s|FAN_ON\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] FAN ON enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ Ventoinha ligada para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								}
+							} else if act == 3 {
+								// toggle LED (actuator 2)
+								ledOn := false
+								if deviceInfo != nil && len(deviceInfo.Actuators) >= 2 {
+									ledOn = deviceInfo.Actuators[1]
+								}
+								if ledOn {
+									if err := sendToGateway("%s|ACT2_OFF\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] LED OFF enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ LED desligado para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								} else {
+									if err := sendToGateway("%s|ACT2_ON\n", id); err != nil {
+										fmt.Printf("[ERR] envio falhou: %v\n", err)
+									} else {
+										fmt.Printf("[LOG] LED ON enviado para: %s (via menu)\n", id)
+									}
+									oneShotMu.Lock()
+									oneShot = fmt.Sprintf("✓ LED ligado para %s", id)
+									oneShotUntil = time.Now().Add(3 * time.Second)
+									oneShotMu.Unlock()
+									render()
+								}
+							} else if act == 4 {
+								// show actuators for selected device (index provided) — already handled 'all' above
+								if deviceInfo != nil {
+									if isDeviceOffline(deviceInfo) {
+										oneShotMu.Lock()
+										oneShot = fmt.Sprintf("%s está offline — sem dados de atuadores", deviceInfo.ID)
+										oneShotUntil = time.Now().Add(6 * time.Second)
+										oneShotMu.Unlock()
+									} else {
+										oneShotMu.Lock()
+										oneShot = fmt.Sprintf("Atuadores de %s: %s", deviceInfo.ID, formatActuators(deviceInfo.Actuators))
+										oneShotUntil = time.Now().Add(6 * time.Second)
+										oneShotMu.Unlock()
+									}
+								}
+								render()
+							} else if act == 5 {
+								// show sensors for selected device (index provided)
+								if deviceInfo != nil {
+									if isDeviceOffline(deviceInfo) {
+										oneShotMu.Lock()
+										oneShot = fmt.Sprintf("%s está offline — sem dados de sensores", deviceInfo.ID)
+										oneShotUntil = time.Now().Add(6 * time.Second)
+										oneShotMu.Unlock()
+									} else {
+										oneShotMu.Lock()
+										oneShot = fmt.Sprintf("Sensores de %s - Temp: %.2f°C, Memória: %.2f%%", deviceInfo.ID, deviceInfo.Temp, deviceInfo.MemoryPct)
+										oneShotUntil = time.Now().Add(6 * time.Second)
+										oneShotMu.Unlock()
+									}
+								}
+								render()
+							} else if act == 6 {
+								// clean memory for selected device
+								if err := sendToGateway("%s|CLEAN_MEM\n", id); err != nil {
+									fmt.Printf("[ERR] envio falhou: %v\n", err)
+								} else {
+									fmt.Printf("[LOG] CLEAN_MEM enviado para: %s (via menu)\n", id)
+								}
+								oneShotMu.Lock()
+								oneShot = fmt.Sprintf("✓ Limpeza de memória solicitada para %s", id)
+								oneShotUntil = time.Now().Add(3 * time.Second)
+								oneShotMu.Unlock()
+								render()
+							}
+							continue
+							continue
+						case 7:
+							// close menu
+							menuMu.Lock()
+							showMenu = false
+							menuMu.Unlock()
+							render()
+							continue
+						default:
+							// unknown action number
 						}
 					}
 				}
-
-				// no implicit numeric actions: only commands trigger behavior
 			}
-		default:
-			// nothing to read
-		}
 
-		// throttle redraws
-		time.Sleep(200 * time.Millisecond)
+			// no implicit numeric actions: only commands trigger behavior
+		}
 	}
 }
 
@@ -435,7 +708,12 @@ func readGateway(conn net.Conn) {
 							d = &DeviceInfo{ID: id}
 							latest = append(latest, d)
 						}
-						d.Temp = temp
+						// apply exponential moving average to smooth rapid changes
+						if d.LastSeen.IsZero() {
+							d.Temp = temp
+						} else {
+							d.Temp = d.Temp*(1.0-tempAlpha) + temp*tempAlpha
+						}
 						d.Offline = false
 						d.LastSeen = time.Now()
 						mu.Unlock()
@@ -458,7 +736,12 @@ func readGateway(conn net.Conn) {
 							d = &DeviceInfo{ID: id}
 							latest = append(latest, d)
 						}
-						d.MemoryPct = pct
+						// smooth memory percentage as well
+						if d.LastSeen.IsZero() {
+							d.MemoryPct = pct
+						} else {
+							d.MemoryPct = d.MemoryPct*(1.0-memAlpha) + pct*memAlpha
+						}
 						d.Offline = false
 						d.LastSeen = time.Now()
 						mu.Unlock()
@@ -507,6 +790,18 @@ func readGateway(conn net.Conn) {
 	}
 }
 
+// sendToGateway writes a formatted line to the current gateway connection.
+// Returns error if not connected or write fails.
+func sendToGateway(format string, a ...interface{}) error {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if gwConn == nil {
+		return errors.New("not connected to gateway")
+	}
+	_, err := fmt.Fprintf(gwConn, format, a...)
+	return err
+}
+
 func readInput(conn net.Conn) {
 	r := bufio.NewReader(os.Stdin)
 	for {
@@ -537,9 +832,13 @@ func readInput(conn net.Conn) {
 			id = target
 		}
 		if cmd == "ON" {
-			fmt.Fprintf(conn, "%s|FAN_ON\n", id)
+			if err := sendToGateway("%s|FAN_ON\n", id); err != nil {
+				pushNotif("failed to send FAN_ON: " + err.Error())
+			}
 		} else if cmd == "OFF" {
-			fmt.Fprintf(conn, "%s|FAN_OFF\n", id)
+			if err := sendToGateway("%s|FAN_OFF\n", id); err != nil {
+				pushNotif("failed to send FAN_OFF: " + err.Error())
+			}
 		} else {
 			pushNotif("unknown action, use on/off")
 		}
@@ -610,10 +909,44 @@ func render() {
 	copy(list, latest)
 	mu.Unlock()
 
+	if selectedID == "" && len(list) > 0 {
+		selectedID = list[0].ID
+	}
+
 	var b strings.Builder
-	b.WriteString(strings.Repeat("=", 58) + "\n")
-	b.WriteString("   Controle PC GAMER (pressione número para alternar)\n")
-	b.WriteString(strings.Repeat("=", 58) + "\n")
+	for i, d := range latest {
+		if isDeviceOffline(d) {
+			b.WriteString(fmt.Sprintf("%d) %s - OFFLINE\n", i+1, d.ID))
+		} else {
+			b.WriteString(fmt.Sprintf("%d) %s - Temp: %.2f, Mem: %.2f%%, Atuadores: %s\n", i+1, d.ID, d.Temp, d.MemoryPct, formatActuators(d.Actuators)))
+		}
+	}
+
+	// Linha-resumo do dispositivo selecionado com os últimos valores registrados.
+	if selectedID != "" {
+		var sel *DeviceInfo
+		for _, d := range list {
+			if d.ID == selectedID {
+				sel = d
+				break
+			}
+		}
+		if sel != nil {
+			led := "OFF"
+			if len(sel.Actuators) > 1 && sel.Actuators[1] {
+				led = "ON"
+			}
+			fan := "OFF"
+			if sel.FanOn {
+				fan = "ON"
+			}
+			b.WriteString(fmt.Sprintf("[DEVICE %s] Temp: %.2f°C  Mem: %.2f%%  Fan:%s  LED (%s)\n", sel.ID, sel.Temp, sel.MemoryPct, fan, led))
+		} else {
+			b.WriteString(fmt.Sprintf("[DEVICE %s] sem dados recentes\n", selectedID))
+		}
+	} else {
+		b.WriteString("[DEVICE] sem dispositivos registrados\n")
+	}
 
 	// by default do not display device list; user requests details with commands
 	// no device list shown by default; client displays device data only on user request
@@ -625,22 +958,25 @@ func render() {
 		b.WriteString(strings.Repeat("-", 58) + "\n")
 		// quick actions numbered
 		b.WriteString("\n Ações rápidas:\n")
-		b.WriteString("  1) Atualizar e mostrar últimos valores de todos os dispositivos\n")
-		b.WriteString("  2) Alternar ventoinha (use: 2 <device_index>)\n")
-		b.WriteString("  3) Alternar LED (use: 3 <device_index>)\n")
-		b.WriteString("  4) Ver atuadores (use: 4 <device_index>)\n")
-		b.WriteString("  5) Ver sensores (use: 5 <device_index>)\n")
-		b.WriteString("  6) Limpar memória (use: 6 <device_index>)\n")
-		b.WriteString("  7) Fechar menu\n")
+		b.WriteString("  0) Sair da aplicação\n")
+		b.WriteString("  1) Mostrar todos os dispositivos e seus valores\n")
+		b.WriteString("  2) Alternar ventoinha (ex: 2 1)\n")
+		b.WriteString("  3) Alternar LED (ex: 3 1)\n")
+		b.WriteString("  4) Ver atuadores do dispositivo (ex: 4 1)\n")
+		b.WriteString("  5) Ver sensores do dispositivo (ex: 5 1)\n")
+		b.WriteString("  6) Limpar memória (ex: 6 1)\n")
+		b.WriteString("  7) Fechar este menu\n")
+
 		// list devices with numbers for quick selection
+		b.WriteString(" Dispositivos registrados:\n")
 		mu.Lock()
 		if len(latest) == 0 {
-			b.WriteString("  (nenhum dispositivo encontrado)\n")
+			b.WriteString("  (Nenhum dispositivo encontrado)\n")
 		} else {
 			for i, d := range latest {
 				off := ""
 				if d.Offline {
-					off = " (offline)"
+					off = " (Offline)"
 				}
 				b.WriteString(fmt.Sprintf("  %d) %s%s\n", i+1, d.ID, off))
 			}
@@ -665,13 +1001,16 @@ func render() {
 	oneShotMu.Unlock()
 
 	screen := b.String()
-	if screen == lastScreen {
-		return
-	}
 	lastScreen = screen
+	// Limpeza forte para evitar "rastros" em terminais com TTY/attach.
+	fmt.Print("\033[2J\033[H\033[3J")
 	fmt.Print(screen)
 	fmt.Println(strings.Repeat("-", 58))
-	fmt.Println(" Pressione 'menu' para abrir opções, ou Q para sair")
+	if !menuOpen {
+		fmt.Println(" Digite 'menu' para abrir opções, 'q' para sair")
+	} else {
+		fmt.Println(" Digite '7' para fechar, 'q' para sair")
+	}
 }
 
 func getenv(k, def string) string {

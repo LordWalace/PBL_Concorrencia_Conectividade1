@@ -47,14 +47,33 @@ func main() {
 
 	// register to gateway using textual protocol expected by PBL integrador
 	regAddr := net.JoinHostPort(gatewayHost, gatewayRegPort)
-	conn, err := net.Dial("tcp", regAddr)
-	if err != nil {
-		log.Fatalf("failed to register to gateway: %v", err)
+	var conn net.Conn
+	var err error
+	backoff := 1 * time.Second
+	for {
+		conn, err = net.Dial("tcp", regAddr)
+		if err != nil {
+			// try fallback GATEWAY_IP if set
+			gwIP := getenv("GATEWAY_IP", "")
+			if gwIP != "" {
+				regAddr = net.JoinHostPort(gwIP, gatewayRegPort)
+				conn, err = net.Dial("tcp", regAddr)
+			}
+		}
+		if err != nil {
+			log.Printf("failed to register to gateway (will retry): %v", err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		break
 	}
 	// send registration in format: REG|AC|<ID>|<PORT> (AC = tipo de atuador)
 	regLine := fmt.Sprintf("REG|AC|%s|%d\n", deviceID, controlPort)
 	if _, err := conn.Write([]byte(regLine)); err != nil {
-		log.Fatalf("failed to send reg: %v", err)
+		log.Printf("failed to send reg (ignored): %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
 	conn.Close()
@@ -63,13 +82,28 @@ func main() {
 	go startControlListener(controlPort, &deviceID)
 
 	// telemetry loop
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(gatewayHost, gatewayUDPPort))
-	if err != nil {
-		log.Fatalf("resolve udp addr: %v", err)
-	}
-	dialConn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		log.Fatalf("dial udp: %v", err)
+	var dialConn *net.UDPConn
+	backoff = 1 * time.Second
+	for {
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(gatewayHost, gatewayUDPPort))
+		if err != nil {
+			log.Printf("resolve udp addr err (retry): %v", err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		dialConn, err = net.DialUDP("udp", nil, addr)
+		if err != nil {
+			log.Printf("dial udp err (retry): %v", err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		break
 	}
 	defer dialConn.Close()
 
@@ -232,6 +266,7 @@ func startControlListener(port int, deviceID *string) {
 
 func handleControlConn(conn net.Conn, deviceID *string) {
 	defer conn.Close()
+	log.Printf("[CONTROL] Recebeu conexão: %s", conn.RemoteAddr().String())
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -240,13 +275,15 @@ func handleControlConn(conn net.Conn, deviceID *string) {
 	}
 	cmd := string(buf[:n])
 	cmd = strings.TrimSpace(cmd)
-	log.Printf("control cmd received for %s: %s", *deviceID, cmd)
+	log.Printf("[CONTROL] Comando recebido para %s: %s (tamanho: %d bytes)", *deviceID, cmd, len(cmd))
 	// support multiple command syntaxes for compatibility
 	switch {
 	case cmd == "FAN_ON":
+		log.Printf("[ACTION] FAN_ON ativado para %s", *deviceID)
 		setActuatorState(0, true, *deviceID)
 		conn.Write([]byte("OK\n"))
 	case cmd == "FAN_OFF":
+		log.Printf("[ACTION] FAN_OFF ativado para %s", *deviceID)
 		setActuatorState(0, false, *deviceID)
 		conn.Write([]byte("OK\n"))
 	case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_ON"):
@@ -254,6 +291,7 @@ func handleControlConn(conn net.Conn, deviceID *string) {
 		s := strings.TrimPrefix(cmd, "ACT")
 		if idxS := strings.Split(s, "_")[0]; idxS != "" {
 			if idx, err := strconv.Atoi(idxS); err == nil {
+				log.Printf("[ACTION] %s ativado para %s", cmd, *deviceID)
 				setActuatorState(idx-1, true, *deviceID)
 				conn.Write([]byte("OK\n"))
 				return
@@ -264,6 +302,7 @@ func handleControlConn(conn net.Conn, deviceID *string) {
 		s := strings.TrimPrefix(cmd, "ACT")
 		if idxS := strings.Split(s, "_")[0]; idxS != "" {
 			if idx, err := strconv.Atoi(idxS); err == nil {
+				log.Printf("[ACTION] %s desativado para %s", cmd, *deviceID)
 				setActuatorState(idx-1, false, *deviceID)
 				conn.Write([]byte("OK\n"))
 				return
@@ -273,18 +312,22 @@ func handleControlConn(conn net.Conn, deviceID *string) {
 	case strings.HasPrefix(cmd, "AC_") && (strings.Contains(cmd, "LIGAR") || strings.Contains(cmd, "DESLIGAR")):
 		// commands like AC_SALA_1|LIGAR
 		if strings.Contains(cmd, "LIGAR") {
+			log.Printf("[ACTION] AC LIGAR ativado para %s", *deviceID)
 			setActuatorState(0, true, *deviceID)
 			conn.Write([]byte("ACK|AC|" + *deviceID + "|LIGADO\n"))
 		} else {
+			log.Printf("[ACTION] AC DESLIGAR ativado para %s", *deviceID)
 			setActuatorState(0, false, *deviceID)
 			conn.Write([]byte("ACK|AC|" + *deviceID + "|DESLIGADO\n"))
 		}
 	default:
+		log.Printf("[ERROR] Comando desconhecido para %s: %s", *deviceID, cmd)
 		conn.Write([]byte("ERR\n"))
 	}
 
 	// custom cleaning command
 	if cmd == "CLEAN_MEM" {
+		log.Printf("[ACTION] CLEAN_MEM iniciado para %s", *deviceID)
 		// start cleaning in background
 		go func() {
 			memoryMu.Lock()

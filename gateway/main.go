@@ -58,6 +58,9 @@ func main() {
 	// start TCP server for clients
 	go startClientTCPServer(clientPort)
 
+	// start periodic status reporter
+	go statusReporter()
+
 	// heartbeat checker
 	go heartbeatChecker()
 
@@ -146,8 +149,7 @@ func startUDPListener(port string) {
 				d = &DeviceInfo{ID: id, IP: remote.IP.String(), Port: 0}
 				devices[id] = d
 			}
-			// store memory percentage in Temp as compatibility and also keep distinct field if needed
-			d.Temp = d.Temp // keep temp unchanged here
+			// keep existing temp unchanged; memory is forwarded separately as TLM|M
 			// extend DeviceInfo with MemoryPercent? we'll add dynamic map via metadata if needed
 			// For now broadcast memory as separate TLM type
 			d.LastSeen = time.Now()
@@ -243,6 +245,8 @@ func handleRegConn(conn net.Conn) {
 		FanOn:    false,
 		Offline:  false,
 	}
+	log.Printf("[DEVICE REGISTRO] %s registrado: IP=%s, PORT=%d", id, remote.IP.String(), port)
+	log.Printf("[GATEWAY] Total de dispositivos: %d", len(devices))
 	mu.Unlock()
 	log.Printf("registered device %s at %s:%d", id, remote.IP.String(), port)
 	// ack
@@ -275,12 +279,14 @@ func handleClientConn(conn net.Conn) {
 	ch := make(chan string, 10)
 	clientChannels[myID] = ch
 	clientMu.Unlock()
+	log.Printf("[CLIENT %d] conectado: %s", myID, conn.RemoteAddr().String())
 	defer func() {
 		clientMu.Lock()
 		delete(clientChannels, myID)
 		close(ch)
 		clientMu.Unlock()
 		conn.Close()
+		log.Printf("[CLIENT %d] desconectado", myID)
 	}()
 
 	reader := bufio.NewReader(conn)
@@ -313,7 +319,7 @@ func handleClientConn(conn net.Conn) {
 		}
 		id := parts[0]
 		cmd := parts[1]
-		log.Printf("client requested %s -> %s", id, cmd)
+		log.Printf("[CLIENT %d] comando recebido: %s -> %s", myID, id, cmd)
 		// forward command to device (id may match device ID directly)
 		go sendCommandToDevice(id, cmd)
 	}
@@ -332,6 +338,7 @@ func sendCommandToDevice(id, cmd string) {
 		return
 	}
 	addr := fmt.Sprintf("%s:%d", d.IP, d.Port)
+	log.Printf("[DEVICE %s] tentando conectar em %s para enviar: %s", id, addr, cmd)
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		log.Printf("failed to connect to device %s at %s: %v", id, addr, err)
@@ -339,12 +346,14 @@ func sendCommandToDevice(id, cmd string) {
 	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "%s\n", cmd)
+	log.Printf("[DEVICE %s] comando enviado com sucesso: %s", id, cmd)
 	// read response (with deadline) and forward ACK to clients
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	respBuf := make([]byte, 512)
 	n, err := conn.Read(respBuf)
 	if err == nil && n > 0 {
 		resp := strings.TrimSpace(string(respBuf[:n]))
+		log.Printf("[DEVICE %s] resposta recebida: %s", id, resp)
 		// broadcast ACK/response to all clients
 		sendToAllClients(resp)
 	}
@@ -377,5 +386,26 @@ func heartbeatChecker() {
 			}
 		}
 		mu.Unlock()
+	}
+}
+
+// statusReporter periodically prints gateway status: devices and clients
+func statusReporter() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		// Report minimal gateway status: counts only. Device-specific telemetry
+		// (TLM/STAT) is responsibility of the device and forwarded to clients.
+		var sb strings.Builder
+		sb.WriteString("=== GATEWAY STATUS ===\n")
+		mu.Lock()
+		sb.WriteString(fmt.Sprintf("Registered devices: %d\n", len(devices)))
+		mu.Unlock()
+
+		clientMu.Lock()
+		sb.WriteString(fmt.Sprintf("Connected clients: %d\n", len(clientChannels)))
+		clientMu.Unlock()
+
+		log.Print(sb.String())
 	}
 }
