@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -267,95 +269,95 @@ func startControlListener(port int, deviceID *string) {
 func handleControlConn(conn net.Conn, deviceID *string) {
 	defer conn.Close()
 	log.Printf("[CONTROL] Recebeu conexão: %s", conn.RemoteAddr().String())
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil {
-		log.Printf("control read err: %v", err)
-		return
-	}
-	cmd := string(buf[:n])
-	cmd = strings.TrimSpace(cmd)
-	log.Printf("[CONTROL] Comando recebido para %s: %s (tamanho: %d bytes)", *deviceID, cmd, len(cmd))
-	// support multiple command syntaxes for compatibility
-	switch {
-	case cmd == "FAN_ON":
-		log.Printf("[ACTION] FAN_ON ativado para %s", *deviceID)
-		setActuatorState(0, true, *deviceID)
-		conn.Write([]byte("OK\n"))
-	case cmd == "FAN_OFF":
-		log.Printf("[ACTION] FAN_OFF ativado para %s", *deviceID)
-		setActuatorState(0, false, *deviceID)
-		conn.Write([]byte("OK\n"))
-	case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_ON"):
-		// ACT1_ON, ACT2_ON ... parse number
-		s := strings.TrimPrefix(cmd, "ACT")
-		if idxS := strings.Split(s, "_")[0]; idxS != "" {
-			if idx, err := strconv.Atoi(idxS); err == nil {
-				log.Printf("[ACTION] %s ativado para %s", cmd, *deviceID)
-				setActuatorState(idx-1, true, *deviceID)
-				conn.Write([]byte("OK\n"))
-				return
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				log.Printf("[CONTROL] conexão fechada pelo peer: %s", conn.RemoteAddr().String())
+			} else {
+				log.Printf("control read err: %v", err)
 			}
+			return
 		}
-		conn.Write([]byte("ERR\n"))
-	case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_OFF"):
-		s := strings.TrimPrefix(cmd, "ACT")
-		if idxS := strings.Split(s, "_")[0]; idxS != "" {
-			if idx, err := strconv.Atoi(idxS); err == nil {
-				log.Printf("[ACTION] %s desativado para %s", cmd, *deviceID)
-				setActuatorState(idx-1, false, *deviceID)
-				conn.Write([]byte("OK\n"))
-				return
-			}
+		cmd := strings.TrimSpace(line)
+		if cmd == "" {
+			continue
 		}
-		conn.Write([]byte("ERR\n"))
-	case strings.HasPrefix(cmd, "AC_") && (strings.Contains(cmd, "LIGAR") || strings.Contains(cmd, "DESLIGAR")):
-		// commands like AC_SALA_1|LIGAR
-		if strings.Contains(cmd, "LIGAR") {
-			log.Printf("[ACTION] AC LIGAR ativado para %s", *deviceID)
+		log.Printf("[CONTROL] Comando recebido para %s: %s (tamanho: %d bytes)", *deviceID, cmd, len(cmd))
+		// support multiple command syntaxes for compatibility
+		switch {
+		case cmd == "FAN_ON":
+			log.Printf("[ACTION] FAN_ON ativado para %s", *deviceID)
 			setActuatorState(0, true, *deviceID)
-			conn.Write([]byte("ACK|AC|" + *deviceID + "|LIGADO\n"))
-		} else {
-			log.Printf("[ACTION] AC DESLIGAR ativado para %s", *deviceID)
+			conn.Write([]byte("OK\n"))
+		case cmd == "FAN_OFF":
+			log.Printf("[ACTION] FAN_OFF ativado para %s", *deviceID)
 			setActuatorState(0, false, *deviceID)
-			conn.Write([]byte("ACK|AC|" + *deviceID + "|DESLIGADO\n"))
-		}
-	default:
-		log.Printf("[ERROR] Comando desconhecido para %s: %s", *deviceID, cmd)
-		conn.Write([]byte("ERR\n"))
-	}
-
-	// custom cleaning command
-	if cmd == "CLEAN_MEM" {
-		log.Printf("[ACTION] CLEAN_MEM iniciado para %s", *deviceID)
-		// start cleaning in background
-		go func() {
-			memoryMu.Lock()
-			if cleaning {
-				memoryMu.Unlock()
-				return
+			conn.Write([]byte("OK\n"))
+		case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_ON"):
+			s := strings.TrimPrefix(cmd, "ACT")
+			if idxS := strings.Split(s, "_")[0]; idxS != "" {
+				if idx, err := strconv.Atoi(idxS); err == nil {
+					log.Printf("[ACTION] %s ativado para %s", cmd, *deviceID)
+					setActuatorState(idx-1, true, *deviceID)
+					conn.Write([]byte("OK\n"))
+					continue
+				}
 			}
-			cleaning = true
-			memoryMu.Unlock()
-			// gradually reduce memory percent
-			for {
+			conn.Write([]byte("ERR\n"))
+		case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_OFF"):
+			s := strings.TrimPrefix(cmd, "ACT")
+			if idxS := strings.Split(s, "_")[0]; idxS != "" {
+				if idx, err := strconv.Atoi(idxS); err == nil {
+					log.Printf("[ACTION] %s desativado para %s", cmd, *deviceID)
+					setActuatorState(idx-1, false, *deviceID)
+					conn.Write([]byte("OK\n"))
+					continue
+				}
+			}
+			conn.Write([]byte("ERR\n"))
+		case strings.HasPrefix(cmd, "AC_") && (strings.Contains(cmd, "LIGAR") || strings.Contains(cmd, "DESLIGAR")):
+			if strings.Contains(cmd, "LIGAR") {
+				log.Printf("[ACTION] AC LIGAR ativado para %s", *deviceID)
+				setActuatorState(0, true, *deviceID)
+				conn.Write([]byte("ACK|AC|" + *deviceID + "|LIGADO\n"))
+			} else {
+				log.Printf("[ACTION] AC DESLIGAR ativado para %s", *deviceID)
+				setActuatorState(0, false, *deviceID)
+				conn.Write([]byte("ACK|AC|" + *deviceID + "|DESLIGADO\n"))
+			}
+		case cmd == "CLEAN_MEM":
+			log.Printf("[ACTION] CLEAN_MEM iniciado para %s", *deviceID)
+			go func() {
 				memoryMu.Lock()
-				if memoryPct <= 0 {
-					memoryPct = 0
-					cleaning = false
+				if cleaning {
 					memoryMu.Unlock()
-					break
+					return
 				}
-				memoryPct -= 5.0
-				if memoryPct < 0 {
-					memoryPct = 0
-				}
+				cleaning = true
 				memoryMu.Unlock()
-				time.Sleep(500 * time.Millisecond)
-			}
-		}()
-		conn.Write([]byte("OK\n"))
-		return
+				for {
+					memoryMu.Lock()
+					if memoryPct <= 0 {
+						memoryPct = 0
+						cleaning = false
+						memoryMu.Unlock()
+						break
+					}
+					memoryPct -= 5.0
+					if memoryPct < 0 {
+						memoryPct = 0
+					}
+					memoryMu.Unlock()
+					time.Sleep(500 * time.Millisecond)
+				}
+			}()
+			conn.Write([]byte("OK\n"))
+		default:
+			log.Printf("[ERROR] Comando desconhecido para %s: %s", *deviceID, cmd)
+			conn.Write([]byte("ERR\n"))
+		}
 	}
 }
 

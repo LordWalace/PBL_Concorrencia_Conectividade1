@@ -162,6 +162,8 @@ func main() {
 			connected = true
 			connMu.Unlock()
 			pushNotif("conectado ao gateway")
+			// update TTY display immediately
+			render()
 			// block reading until connection ends
 			readGateway(conn)
 			// readGateway returned -> connection lost
@@ -173,6 +175,8 @@ func main() {
 			}
 			connMu.Unlock()
 			pushNotif("desconectado do gateway, reconectando...")
+			// update display to reflect disconnect
+			render()
 			time.Sleep(retryInterval)
 		}
 	}()
@@ -831,6 +835,8 @@ func readGateway(conn net.Conn) {
 						if b, err := json.Marshal(evt); err == nil {
 							broadcastEvent(string(b))
 						}
+						// atualizar TTY imediatamente ao receber telemetria
+						render()
 					}
 				} else if sensorType == "M" {
 					if pct, err := strconv.ParseFloat(valStr, 64); err == nil {
@@ -859,6 +865,8 @@ func readGateway(conn net.Conn) {
 						if b, err := json.Marshal(evt); err == nil {
 							broadcastEvent(string(b))
 						}
+						// atualizar TTY imediatamente ao receber atualização de memória
+						render()
 					}
 				}
 			}
@@ -893,6 +901,8 @@ func readGateway(conn net.Conn) {
 				d.Offline = false
 				d.LastSeen = time.Now()
 				mu.Unlock()
+				// atualizar TTY quando STAT/atuadores chegam
+				render()
 			}
 		default:
 			// ignore other messages for now
@@ -1102,7 +1112,10 @@ func render() {
 	connMu.Lock()
 	isConn := connected
 	connMu.Unlock()
-	if !isConn {
+	if isConn {
+		b.WriteString(strings.Repeat("-", 58) + "\n")
+		b.WriteString("STATUS: conectado ao gateway\n")
+	} else {
 		b.WriteString(strings.Repeat("-", 58) + "\n")
 		b.WriteString("STATUS: desconectado do gateway — verifique se o servidor está ativo\n")
 	}

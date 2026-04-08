@@ -23,6 +23,12 @@ type DeviceInfo struct {
 	Offline   bool      `json:"offline"`
 }
 
+// queuedCmd represents a command request to a device coming from a client.
+type queuedCmd struct {
+	cmd      string
+	clientID int // 0 = system/broadcast
+}
+
 type RegMessage struct {
 	ID          string `json:"id"`
 	ControlPort int    `json:"control_port"`
@@ -38,6 +44,7 @@ type Telemetry struct {
 type clientEntry struct {
 	ch   chan string
 	addr string
+	conn net.Conn
 }
 
 var (
@@ -46,6 +53,12 @@ var (
 	clientChannels = make(map[int]clientEntry)
 	clientMu       sync.Mutex
 	clientCounter  int
+	// persistent connections to devices to avoid reconnecting for each command
+	deviceConns   = make(map[string]net.Conn)
+	deviceConnsMu sync.Mutex
+	// per-device command queues
+	deviceQueues   = make(map[string]chan queuedCmd)
+	deviceQueuesMu sync.Mutex
 )
 
 func main() {
@@ -133,9 +146,9 @@ func startUDPListener(port string) {
 			sendToAllClients(fmt.Sprintf("TLM|T|%s|%.2f", id, temp))
 			// simple automation
 			if temp > 75.0 && !d.FanOn {
-				go sendCommandToDevice(id, "FAN_ON")
+				go enqueueCommandToDevice(id, "FAN_ON", 0)
 			} else if temp < 60.0 && d.FanOn {
-				go sendCommandToDevice(id, "FAN_OFF")
+				go enqueueCommandToDevice(id, "FAN_OFF", 0)
 			}
 			continue
 		case "MEM":
@@ -283,7 +296,9 @@ func handleClientConn(conn net.Conn) {
 	clientCounter++
 	myID := clientCounter
 	ch := make(chan string, 10)
-	clientChannels[myID] = clientEntry{ch: ch, addr: conn.RemoteAddr().String()}
+	// register client without rejecting other clients from same host/IP
+	remoteAddr := conn.RemoteAddr().String()
+	clientChannels[myID] = clientEntry{ch: ch, addr: remoteAddr, conn: conn}
 	clientMu.Unlock()
 	log.Printf("[CLIENT %d] conectado: %s", myID, conn.RemoteAddr().String())
 	defer func() {
@@ -330,41 +345,142 @@ func handleClientConn(conn net.Conn) {
 		cmd := parts[1]
 		log.Printf("[CLIENT %d] comando recebido: %s -> %s", myID, id, cmd)
 		// forward command to device (id may match device ID directly)
-		go sendCommandToDevice(id, cmd)
+		go enqueueCommandToDevice(id, cmd, myID)
 	}
 }
 
-func sendCommandToDevice(id, cmd string) {
-	mu.Lock()
-	d, ok := devices[id]
-	mu.Unlock()
-	if !ok {
-		log.Printf("sendCommand: unknown device %s", id)
-		return
+// enqueueCommandToDevice enqueues a command for a device; clientID==0 means system/broadcast
+func enqueueCommandToDevice(id, cmd string, clientID int) {
+	deviceQueuesMu.Lock()
+	q := deviceQueues[id]
+	if q == nil {
+		q = make(chan queuedCmd, 100)
+		deviceQueues[id] = q
+		go deviceCommandWorker(id, q)
 	}
-	if d.Port == 0 {
-		log.Printf("sendCommand: device %s has no control port", id)
-		return
-	}
-	addr := fmt.Sprintf("%s:%d", d.IP, d.Port)
-	log.Printf("[DEVICE %s] Tentando conectar em %s para enviar: %s", id, addr, cmd)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		log.Printf("failed to connect to device %s at %s: %v", id, addr, err)
-		return
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "%s\n", cmd)
-	log.Printf("[DEVICE %s] comando enviado com sucesso: %s", id, cmd)
-	// read response (with deadline) and forward ACK to clients
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	respBuf := make([]byte, 512)
-	n, err := conn.Read(respBuf)
-	if err == nil && n > 0 {
-		resp := strings.TrimSpace(string(respBuf[:n]))
+	deviceQueuesMu.Unlock()
+	q <- queuedCmd{cmd: cmd, clientID: clientID}
+}
+
+func deviceCommandWorker(id string, q chan queuedCmd) {
+	for qc := range q {
+		mu.Lock()
+		d, ok := devices[id]
+		mu.Unlock()
+		if !ok {
+			log.Printf("enqueue: unknown device %s", id)
+			if qc.clientID == 0 {
+				sendToAllClients(fmt.Sprintf("ERR|%s|unknown_device", id))
+			} else {
+				sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|unknown_device", id))
+			}
+			continue
+		}
+		if d.Port == 0 {
+			log.Printf("enqueue: device %s has no control port", id)
+			if qc.clientID == 0 {
+				sendToAllClients(fmt.Sprintf("ERR|%s|no_control_port", id))
+			} else {
+				sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|no_control_port", id))
+			}
+			continue
+		}
+		addr := fmt.Sprintf("%s:%d", d.IP, d.Port)
+
+		// ensure we have a connection (reuse if possible)
+		deviceConnsMu.Lock()
+		conn := deviceConns[id]
+		deviceConnsMu.Unlock()
+		var err error
+		if conn == nil {
+			log.Printf("[DEVICE %s] dialing %s to send: %s", id, addr, qc.cmd)
+			conn, err = net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				log.Printf("failed to connect to device %s at %s: %v", id, addr, err)
+				if qc.clientID == 0 {
+					sendToAllClients(fmt.Sprintf("ERR|%s|unreachable", id))
+				} else {
+					sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|unreachable", id))
+				}
+				continue
+			}
+			deviceConnsMu.Lock()
+			deviceConns[id] = conn
+			deviceConnsMu.Unlock()
+		}
+
+		// write command
+		_, err = fmt.Fprintf(conn, "%s\n", qc.cmd)
+		if err != nil {
+			// try reconnect once
+			log.Printf("[DEVICE %s] write failed, reconnecting: %v", id, err)
+			conn.Close()
+			deviceConnsMu.Lock()
+			delete(deviceConns, id)
+			deviceConnsMu.Unlock()
+			conn, err = net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				log.Printf("failed to reconnect to device %s at %s: %v", id, addr, err)
+				if qc.clientID == 0 {
+					sendToAllClients(fmt.Sprintf("ERR|%s|unreachable", id))
+				} else {
+					sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|unreachable", id))
+				}
+				continue
+			}
+			deviceConnsMu.Lock()
+			deviceConns[id] = conn
+			deviceConnsMu.Unlock()
+			_, err = fmt.Fprintf(conn, "%s\n", qc.cmd)
+			if err != nil {
+				log.Printf("[DEVICE %s] write after reconnect failed: %v", id, err)
+				if qc.clientID == 0 {
+					sendToAllClients(fmt.Sprintf("ERR|%s|write_failed", id))
+				} else {
+					sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|write_failed", id))
+				}
+				continue
+			}
+		}
+		log.Printf("[DEVICE %s] comando enviado com sucesso: %s", id, qc.cmd)
+
+		// read response (with deadline)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		reader := bufio.NewReader(conn)
+		resp, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("[DEVICE %s] read response error: %v", id, err)
+			// drop connection for next time
+			conn.Close()
+			deviceConnsMu.Lock()
+			delete(deviceConns, id)
+			deviceConnsMu.Unlock()
+			if qc.clientID == 0 {
+				sendToAllClients(fmt.Sprintf("ERR|%s|no_response", id))
+			} else {
+				sendToClient(qc.clientID, fmt.Sprintf("ERR|%s|no_response", id))
+			}
+			continue
+		}
+		resp = strings.TrimSpace(resp)
 		log.Printf("[DEVICE %s] resposta recebida: %s", id, resp)
-		// broadcast ACK/response to all clients
-		sendToAllClients(resp)
+		if qc.clientID == 0 {
+			sendToAllClients(resp)
+		} else {
+			sendToClient(qc.clientID, resp)
+		}
+	}
+}
+
+// sendToClient sends a message only to the specified clientID if connected
+func sendToClient(clientID int, msg string) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if e, ok := clientChannels[clientID]; ok {
+		select {
+		case e.ch <- msg:
+		default:
+		}
 	}
 }
 
@@ -412,19 +528,21 @@ func statusReporter() {
 		mu.Unlock()
 
 		clientMu.Lock()
-		// count unique remote addresses for transparency
+		// count unique remote IPs for transparency
 		unique := make(map[string]struct{})
 		for _, e := range clientChannels {
 			if e.addr != "" {
-				unique[e.addr] = struct{}{}
+				host, _, _ := net.SplitHostPort(e.addr)
+				unique[host] = struct{}{}
 			}
 		}
 		sb.WriteString(fmt.Sprintf("Connected clients (channels): %d\n", len(clientChannels)))
-		sb.WriteString(fmt.Sprintf("Connected clients (unique addrs): %d\n", len(unique)))
+		sb.WriteString(fmt.Sprintf("Connected clients (unique IPs): %d\n", len(unique)))
 		if len(clientChannels) > 0 {
 			sb.WriteString("Clients detail:\n")
 			for id, e := range clientChannels {
-				sb.WriteString(fmt.Sprintf("  id=%d addr=%s\n", id, e.addr))
+				host, port, _ := net.SplitHostPort(e.addr)
+				sb.WriteString(fmt.Sprintf("  id=%d ip=%s port=%s\n", id, host, port))
 			}
 		}
 		clientMu.Unlock()
