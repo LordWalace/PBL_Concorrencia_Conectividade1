@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -18,11 +17,16 @@ type RegMessage struct {
 	ControlPort int    `json:"control_port"`
 }
 
-type Telemetry struct {
-	ID    string  `json:"id"`
-	Temp  float64 `json:"temp"`
-	FanOn bool    `json:"fan_on"`
-}
+var (
+	actuators      []bool
+	actuatorsMu    sync.Mutex
+	gatewayUDPAddr string
+	memoryPct      float64
+	memoryMu       sync.Mutex
+	cleaning       bool
+	powered        bool = false
+	poweredMu      sync.Mutex
+)
 
 func main() {
 	deviceID := getenv("DEVICE_ID", "GPU_01")
@@ -32,343 +36,278 @@ func main() {
 	gatewayRegPort := getenv("GATEWAY_TCP_REG_PORT", "5002")
 	gatewayUDPPort := getenv("GATEWAY_UDP_PORT", "5001")
 
-	// prepare gateway UDP address for sending status updates
 	gatewayUDPAddr = net.JoinHostPort(gatewayHost, gatewayUDPPort)
 
-	// setup actuators (count configurable)
-	actCountStr := getenv("DEVICE_ACT_COUNT", "2")
+	actCountStr := getenv("DEVICE_ACT_COUNT", "3")
 	actCount, _ := strconv.Atoi(actCountStr)
-	if actCount < 1 {
-		actCount = 1
-	}
+	if actCount < 3 { actCount = 3 }
+	
 	actuatorsMu.Lock()
 	actuators = make([]bool, actCount)
 	actuatorsMu.Unlock()
 
-	log.Printf("Device %s starting (control:%d) -> gateway %s (reg:%s udp:%s)", deviceID, controlPort, gatewayHost, gatewayRegPort, gatewayUDPPort)
+	log.Printf("Device %s starting -> gateway %s", deviceID, gatewayHost)
 
-	// register to gateway using textual protocol expected by PBL integrador
-	regAddr := net.JoinHostPort(gatewayHost, gatewayRegPort)
-	var conn net.Conn
-	var err error
-	backoff := 1 * time.Second
-	for {
-		conn, err = net.Dial("tcp", regAddr)
-		if err != nil {
-			// try fallback GATEWAY_IP if set
-			gwIP := getenv("GATEWAY_IP", "")
-			if gwIP != "" {
-				regAddr = net.JoinHostPort(gwIP, gatewayRegPort)
-				conn, err = net.Dial("tcp", regAddr)
+	safeGo(func() {
+		for {
+			err := registerToGateway(deviceID, gatewayHost, gatewayRegPort, controlPortStr)
+			if err != nil {
+				if gwIP := getenv("GATEWAY_IP", ""); gwIP != "" {
+					errFallback := registerToGateway(deviceID, gwIP, gatewayRegPort, controlPortStr)
+					if errFallback == nil {
+						log.Printf("Reconectado/Registrado no gateway (fallback) com sucesso!")
+					}
+				}
 			}
+			time.Sleep(3 * time.Second)
 		}
-		if err != nil {
-			log.Printf("failed to register to gateway (will retry): %v", err)
-			time.Sleep(backoff)
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		break
-	}
-	// send registration in format: REG|AC|<ID>|<PORT> (AC = tipo de atuador)
-	regLine := fmt.Sprintf("REG|AC|%s|%d\n", deviceID, controlPort)
-	if _, err := conn.Write([]byte(regLine)); err != nil {
-		log.Printf("failed to send reg (ignored): %v", err)
-	}
-	time.Sleep(200 * time.Millisecond)
-	conn.Close()
+	})
 
-	// start TCP control listener
-	go startControlListener(controlPort, &deviceID)
+	safeGo(func() { startControlListener(controlPort, &deviceID) })
+	
+	safeGo(func() {
+		for {
+			telemetryLoop(deviceID, gatewayHost, gatewayUDPPort)
+			time.Sleep(1 * time.Second)
+		}
+	})
 
-	// telemetry loop
-	var dialConn *net.UDPConn
-	backoff = 1 * time.Second
-	for {
-		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(gatewayHost, gatewayUDPPort))
-		if err != nil {
-			log.Printf("resolve udp addr err (retry): %v", err)
-			time.Sleep(backoff)
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		dialConn, err = net.DialUDP("udp", nil, addr)
-		if err != nil {
-			log.Printf("dial udp err (retry): %v", err)
-			time.Sleep(backoff)
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		break
-	}
-	defer dialConn.Close()
-
-	temp := 65.0
-	// memory percent simulation
-	memoryMu.Lock()
-	memoryPct = 30.0
-	cleaning = false
-	memoryMu.Unlock()
-	// telemetry at 200ms and smoother thermal deltas
-	ticker := time.NewTicker(200 * time.Millisecond)
-	for range ticker.C {
-		// read latest fan state at start of cycle
-		fanOn := getFanState()
-		if !fanOn {
-			temp += 0.2 // slower rise when fan off
-			if temp > 100.0 {
-				temp = 100.0
-			}
-		} else {
-			temp -= 0.4 // cooling when fan on
-			if temp < 30.0 {
-				temp = 30.0
-			}
-		}
-		// send telemetry as textual message: T|<ID>|<temp>
-		teleLine := fmt.Sprintf("T|%s|%.2f\n", deviceID, temp)
-		if _, err := dialConn.Write([]byte(teleLine)); err != nil {
-			log.Printf("udp write err: %v", err)
-		}
-		// update memory usage (unless cleaning)
-		memoryMu.Lock()
-		if !cleaning {
-			memoryPct += 0.3
-			if memoryPct > 100.0 {
-				memoryPct = 100.0
-			}
-		}
-		memPct := memoryPct
-		memoryMu.Unlock()
-		memLine := fmt.Sprintf("MEM|%s|%.2f\n", deviceID, memPct)
-		if _, err := dialConn.Write([]byte(memLine)); err != nil {
-			log.Printf("udp write err: %v", err)
-		}
-
-		// print local status to stdout (actuators + sensors)
-		actuatorsMu.Lock()
-		snap := make([]bool, len(actuators))
-		copy(snap, actuators)
-		actuatorsMu.Unlock()
-		// LED color rules: if cleaning -> blue, if pct>=90 red, pct<=50 green, else yellow
-		ledColor := ""
-		ledText := "LED"
-		if cleaning {
-			ledColor = "\033[34m" // blue
-		} else if memPct >= 90.0 {
-			ledColor = "\033[31m" // red
-		} else if memPct <= 50.0 {
-			ledColor = "\033[32m" // green
-		} else {
-			ledColor = "\033[33m" // yellow
-		}
-		// show LED only if actuator 2 exists
-		ledStatus := "OFF"
-		if len(snap) > 1 && snap[1] {
-			ledStatus = "ON"
-		}
-		fanStatus := "OFF"
-		if len(snap) > 0 && snap[0] {
-			fanStatus = "ON"
-		}
-		fmt.Printf("[DEVICE %s] Temp: %.2f°C  Mem: %.2f%%  Fan:%s  %s%s%s (%s)\n", deviceID, temp, memPct, fanStatus, ledColor, ledText, "\033[0m", ledStatus)
-		// fanOn may be updated by control listener; read file-scoped var
-		// short sleep handled by ticker
-		// ensure we read the latest fan state from small shared storage via file scope variable
-		// (control listener will update the global variable via package-level state)
-		// We'll use a small file-level mechanism: read from control state file
-		// but for simplicity here, we set fanOn via a shared global updated in listener
-		fanOn = getFanState()
-	}
+	select {}
 }
 
-var (
-	actuators      []bool
-	actuatorsMu    sync.Mutex
-	gatewayUDPAddr string
-	// memory simulation globals
-	memoryPct float64
-	memoryMu  sync.Mutex
-	cleaning  bool
-)
-
-func getFanState() bool {
-	return getActuatorState(0)
+func safeGo(fn func()) {
+	go func() {
+		defer func() { if r := recover(); r != nil { log.Printf("panic recovered: %v", r) } }()
+		fn()
+	}()
 }
 
-func setFanState(v bool) {
-	setActuatorState(0, v, "")
-}
-
+func getFanState() bool { return getActuatorState(0) }
 func getActuatorState(idx int) bool {
 	actuatorsMu.Lock()
 	defer actuatorsMu.Unlock()
-	if idx < 0 || idx >= len(actuators) {
-		return false
-	}
+	if idx < 0 || idx >= len(actuators) { return false }
 	return actuators[idx]
 }
 
-func setActuatorState(idx int, v bool, deviceID string) {
+func setActuatorState(idx int, v bool, deviceID string) bool {
 	actuatorsMu.Lock()
+	changed := false
 	if idx >= 0 && idx < len(actuators) {
-		actuators[idx] = v
+		if actuators[idx] != v { actuators[idx] = v; changed = true }
 	}
 	snap := make([]bool, len(actuators))
 	copy(snap, actuators)
 	actuatorsMu.Unlock()
 
-	// if deviceID missing, nothing to report
-	if deviceID == "" {
-		return
-	}
+	if deviceID == "" || !changed { return changed }
+
 	parts := make([]string, len(snap))
-	for i, b := range snap {
-		if b {
-			parts[i] = "1"
-		} else {
-			parts[i] = "0"
+	for i, b := range snap { if b { parts[i] = "1" } else { parts[i] = "0" } }
+	statLine := fmt.Sprintf("STAT|%s|%s\n", deviceID, strings.Join(parts, ","))
+	
+	if addr, err := net.ResolveUDPAddr("udp", gatewayUDPAddr); err == nil {
+		if conn, err := net.DialUDP("udp", nil, addr); err == nil {
+			conn.Write([]byte(statLine))
+			conn.Close()
 		}
 	}
-	statLine := fmt.Sprintf("STAT|%s|%s\n", deviceID, strings.Join(parts, ","))
-	addr, err := net.ResolveUDPAddr("udp", gatewayUDPAddr)
-	if err != nil {
-		return
-	}
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	conn.Write([]byte(statLine))
+	return changed
 }
 
 func startControlListener(port int, deviceID *string) {
 	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
-	if err != nil {
-		log.Fatalf("control listener err: %v", err)
-	}
+	if err != nil { log.Fatalf("control listener err: %v", err) }
 	defer ln.Close()
-	log.Printf("control listener on %d", port)
+	
 	for {
 		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("control accept: %v", err)
-			continue
-		}
-		go handleControlConn(conn, deviceID)
+		if err != nil { continue }
+		safeGo(func() { handleControlConn(conn, deviceID) })
 	}
 }
 
 func handleControlConn(conn net.Conn, deviceID *string) {
 	defer conn.Close()
-	log.Printf("[CONTROL] Recebeu conexão: %s", conn.RemoteAddr().String())
 	reader := bufio.NewReader(conn)
+	
 	for {
 		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("[CONTROL] conexão fechada pelo peer: %s", conn.RemoteAddr().String())
-			} else {
-				log.Printf("control read err: %v", err)
-			}
-			return
-		}
+		if err != nil { return } 
+		
 		cmd := strings.TrimSpace(line)
-		if cmd == "" {
-			continue
-		}
-		// support multiple command syntaxes for compatibility
+		if cmd == "" { continue }
+		
+		log.Printf("[ACTION] Comando %s para %s", cmd, *deviceID)
+		
+		var changed bool
+		var resp string = "ERR\n"
+
 		switch {
-		case cmd == "FAN_ON":
-			log.Printf("[ACTION] FAN_ON ativado para %s", *deviceID)
-			setActuatorState(0, true, *deviceID)
-			conn.Write([]byte("OK\n"))
-		case cmd == "FAN_OFF":
-			log.Printf("[ACTION] FAN_OFF ativado para %s", *deviceID)
-			setActuatorState(0, false, *deviceID)
-			conn.Write([]byte("OK\n"))
-		case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_ON"):
-			s := strings.TrimPrefix(cmd, "ACT")
-			if idxS := strings.Split(s, "_")[0]; idxS != "" {
-				if idx, err := strconv.Atoi(idxS); err == nil {
-					log.Printf("[ACTION] %s ativado para %s", cmd, *deviceID)
-					setActuatorState(idx-1, true, *deviceID)
-					conn.Write([]byte("OK\n"))
-					continue
+		case cmd == "FAN_ON", cmd == "AC_LIGAR":
+			changed = setActuatorState(0, true, *deviceID)
+			if changed { resp = "OK\n" } else { resp = "NOOP\n" }
+		case cmd == "FAN_OFF", cmd == "AC_DESLIGAR":
+			changed = setActuatorState(0, false, *deviceID)
+			if changed { resp = "OK\n" } else { resp = "NOOP\n" }
+		case strings.HasPrefix(cmd, "ACT") && (strings.HasSuffix(cmd, "_ON") || strings.HasSuffix(cmd, "_OFF")):
+			parts := strings.Split(strings.TrimPrefix(cmd, "ACT"), "_")
+			if idx, err := strconv.Atoi(parts[0]); err == nil {
+				isOn := parts[1] == "ON"
+				changed = setActuatorState(idx-1, isOn, *deviceID)
+				if changed && idx == 3 {
+					poweredMu.Lock(); powered = isOn; poweredMu.Unlock()
 				}
-			}
-			conn.Write([]byte("ERR\n"))
-		case strings.HasPrefix(cmd, "ACT") && strings.Contains(cmd, "_OFF"):
-			s := strings.TrimPrefix(cmd, "ACT")
-			if idxS := strings.Split(s, "_")[0]; idxS != "" {
-				if idx, err := strconv.Atoi(idxS); err == nil {
-					log.Printf("[ACTION] %s desativado para %s", cmd, *deviceID)
-					setActuatorState(idx-1, false, *deviceID)
-					conn.Write([]byte("OK\n"))
-					continue
-				}
-			}
-			conn.Write([]byte("ERR\n"))
-		case strings.HasPrefix(cmd, "AC_") && (strings.Contains(cmd, "LIGAR") || strings.Contains(cmd, "DESLIGAR")):
-			if strings.Contains(cmd, "LIGAR") {
-				log.Printf("[ACTION] AC LIGAR ativado para %s", *deviceID)
-				setActuatorState(0, true, *deviceID)
-				conn.Write([]byte("ACK|AC|" + *deviceID + "|LIGADO\n"))
-			} else {
-				log.Printf("[ACTION] AC DESLIGAR ativado para %s", *deviceID)
-				setActuatorState(0, false, *deviceID)
-				conn.Write([]byte("ACK|AC|" + *deviceID + "|DESLIGADO\n"))
+				if changed { resp = "OK\n" } else { resp = "NOOP\n" }
 			}
 		case cmd == "CLEAN_MEM":
-			log.Printf("[ACTION] CLEAN_MEM iniciado para %s", *deviceID)
-			go func() {
-				memoryMu.Lock()
-				if cleaning {
-					memoryMu.Unlock()
-					return
-				}
-				cleaning = true
-				memoryMu.Unlock()
-				for {
-					memoryMu.Lock()
-					if memoryPct <= 0 {
-						memoryPct = 0
-						cleaning = false
-						memoryMu.Unlock()
-						break
-					}
-					memoryPct -= 5.0
-					if memoryPct < 0 {
-						memoryPct = 0
-					}
-					memoryMu.Unlock()
-					time.Sleep(500 * time.Millisecond)
-				}
-			}()
-			conn.Write([]byte("OK\n"))
-		default:
-			log.Printf("[ERROR] Comando desconhecido para %s: %s", *deviceID, cmd)
-			conn.Write([]byte("ERR\n"))
+			safeGo(func() { runMemoryClean(*deviceID) })
+			resp = "OK\n"
+		}
+		
+		conn.Write([]byte(resp))
+	}
+}
+
+func runMemoryClean(deviceID string) {
+	memoryMu.Lock()
+	if cleaning { memoryMu.Unlock(); return }
+	cleaning = true
+	memoryMu.Unlock()
+
+	// CORRECAO AQUI: O dispositivo avisava CLEAR em vez de CLEAN. Padronizado para CLEAN|id|1.
+	notifyGateway(fmt.Sprintf("CLEAN|%s|1\n", deviceID))
+	
+	for {
+		memoryMu.Lock()
+		if memoryPct <= 0 {
+			memoryPct = 0
+			memoryMu.Unlock()
+			notifyGateway(fmt.Sprintf("CLEAN|%s|0\n", deviceID))
+			memoryMu.Lock(); cleaning = false; memoryMu.Unlock()
+			break
+		}
+		memoryPct -= 5.0
+		if memoryPct < 0 { memoryPct = 0 }
+		memoryMu.Unlock()
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func notifyGateway(msg string) {
+	addr, err := net.ResolveUDPAddr("udp", gatewayUDPAddr)
+	if err == nil {
+		if c, err := net.DialUDP("udp", nil, addr); err == nil {
+			c.Write([]byte(msg))
+			c.Close()
 		}
 	}
 }
 
-// extend to handle CLEAN_MEM command
-func init() {
-	// nothing here; keep for organizing helper if needed
+func registerToGateway(deviceID, gatewayHost, gatewayRegPort, controlPort string) error {
+	regAddr := net.JoinHostPort(gatewayHost, gatewayRegPort)
+	conn, err := net.DialTimeout("tcp", regAddr, 3*time.Second)
+	if err != nil { return err }
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, err = conn.Write([]byte(fmt.Sprintf("REG|AC|%s|%s\n", deviceID, controlPort)))
+	if err != nil { return err }
+
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil { return err }
+	if !strings.HasPrefix(resp, "ACK") { return fmt.Errorf("unexpected response: %s", resp) }
+
+	return nil
 }
 
 func getenv(k, def string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
+	if v := os.Getenv(k); v != "" { return v }
+	return def
+}
+
+func telemetryLoop(deviceID, gatewayHost, gatewayUDPPort string) {
+	var localConn *net.UDPConn
+	backoff := 1 * time.Second
+	var remoteAddr *net.UDPAddr
+	
+	for {
+		var err error
+		remoteAddr, err = net.ResolveUDPAddr("udp", net.JoinHostPort(gatewayHost, gatewayUDPPort))
+		if err != nil { time.Sleep(backoff); continue }
+		localConn, err = net.ListenUDP("udp", nil)
+		if err != nil { time.Sleep(backoff); continue }
+		break
 	}
-	return v
+	defer func() { if localConn != nil { localConn.Close() } }()
+
+	actuatorsMu.Lock()
+	snap := make([]bool, len(actuators))
+	copy(snap, actuators)
+	actuatorsMu.Unlock()
+	parts := make([]string, len(snap))
+	for i, b := range snap { if b { parts[i] = "1" } else { parts[i] = "0" } }
+	localConn.WriteToUDP([]byte(fmt.Sprintf("STAT|%s|%s\n", deviceID, strings.Join(parts, ","))), remoteAddr)
+
+	temp := 65.0
+	memoryMu.Lock(); memoryPct = 30.0; cleaning = false; memoryMu.Unlock()
+	
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	
+	lastStat := time.Now().Add(-10 * time.Second)
+	
+	for range ticker.C {
+		poweredMu.Lock(); p := powered; poweredMu.Unlock()
+		if !p {
+			if time.Since(lastStat) >= 2*time.Second {
+				if localConn == nil { localConn, _ = net.ListenUDP("udp", nil) }
+				if localConn != nil {
+					actuatorsMu.Lock()
+					copy(snap, actuators)
+					actuatorsMu.Unlock()
+					for i, b := range snap { if b { parts[i] = "1" } else { parts[i] = "0" } }
+					if _, err := localConn.WriteToUDP([]byte(fmt.Sprintf("STAT|%s|%s\n", deviceID, strings.Join(parts, ","))), remoteAddr); err != nil {
+						localConn.Close(); localConn = nil
+					} else {
+						lastStat = time.Now()
+					}
+				}
+			}
+			continue
+		}
+
+		fanOn := getFanState()
+		if !fanOn { temp += 0.2; if temp > 100.0 { temp = 100.0 } } else { temp -= 0.4; if temp < 30.0 { temp = 30.0 } }
+
+		if localConn == nil { localConn, _ = net.ListenUDP("udp", nil) }
+		if localConn != nil {
+			if _, err := localConn.WriteToUDP([]byte(fmt.Sprintf("T|%s|%.2f\n", deviceID, temp)), remoteAddr); err != nil {
+				localConn.Close(); localConn = nil
+			}
+		}
+
+		memoryMu.Lock()
+		if !cleaning { memoryPct += 0.3; if memoryPct > 100.0 { memoryPct = 100.0 } }
+		memPct := memoryPct
+		cleanState := cleaning
+		memoryMu.Unlock()
+		
+		if localConn != nil {
+			if _, err := localConn.WriteToUDP([]byte(fmt.Sprintf("MEM|%s|%.2f\n", deviceID, memPct)), remoteAddr); err != nil {
+				localConn.Close(); localConn = nil
+			}
+		}
+
+		actuatorsMu.Lock()
+		copy(snap, actuators)
+		actuatorsMu.Unlock()
+		
+		ledColor, ledText, ledStatus, fanStatus := "\033[33m", "LED", "OFF", "OFF"
+		if cleanState { ledColor = "\033[34m" } else if memPct >= 90.0 { ledColor = "\033[31m" } else if memPct <= 50.0 { ledColor = "\033[32m" }
+		if len(snap) > 1 && snap[1] { ledStatus = "ON" }
+		if len(snap) > 0 && snap[0] { fanStatus = "ON" }
+		
+		fmt.Printf("[DEVICE %s] Temp: %.2f°C  Mem: %.2f%%  Fan:%s  %s%s\033[0m (%s)\n", deviceID, temp, memPct, fanStatus, ledColor, ledText, ledStatus)
+	}
 }
