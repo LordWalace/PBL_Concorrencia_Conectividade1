@@ -187,6 +187,28 @@ func main() {
 	uiPort := getenv("CLIENT_UI_PORT", "9000")
 	go startHTTPServer(":" + uiPort)
 
+	// monitor offline transitions and update UI only on status changes
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			changed := false
+			mu.Lock()
+			for _, d := range latest {
+				was := d.Offline
+				now := isDeviceOffline(d)
+				if was != now {
+					d.Offline = now
+					changed = true
+				}
+			}
+			mu.Unlock()
+			if changed {
+				render()
+			}
+		}
+	}()
+
 	// stdin reader goroutine: reads lines and pushes to inputCh
 	go func(ch chan<- string) {
 		r := bufio.NewReader(os.Stdin)
@@ -818,10 +840,13 @@ func readGateway(conn net.Conn) {
 								break
 							}
 						}
+						created := false
 						if d == nil {
 							d = &DeviceInfo{ID: id}
 							latest = append(latest, d)
+							created = true
 						}
+						prevOffline := d.Offline
 						// apply exponential moving average to smooth rapid changes
 						if d.LastSeen.IsZero() {
 							d.Temp = temp
@@ -835,8 +860,10 @@ func readGateway(conn net.Conn) {
 						if b, err := json.Marshal(evt); err == nil {
 							broadcastEvent(string(b))
 						}
-						// atualizar TTY imediatamente ao receber telemetria
-						render()
+						// only redraw if a new device appeared or it was previously offline
+						if created || prevOffline {
+							render()
+						}
 					}
 				} else if sensorType == "M" {
 					if pct, err := strconv.ParseFloat(valStr, 64); err == nil {
@@ -848,10 +875,13 @@ func readGateway(conn net.Conn) {
 								break
 							}
 						}
+						created := false
 						if d == nil {
 							d = &DeviceInfo{ID: id}
 							latest = append(latest, d)
+							created = true
 						}
+						prevOffline := d.Offline
 						// smooth memory percentage as well
 						if d.LastSeen.IsZero() {
 							d.MemoryPct = pct
@@ -865,8 +895,9 @@ func readGateway(conn net.Conn) {
 						if b, err := json.Marshal(evt); err == nil {
 							broadcastEvent(string(b))
 						}
-						// atualizar TTY imediatamente ao receber atualização de memória
-						render()
+						if created || prevOffline {
+							render()
+						}
 					}
 				}
 			}
@@ -882,10 +913,13 @@ func readGateway(conn net.Conn) {
 						break
 					}
 				}
+				created := false
 				if d == nil {
 					d = &DeviceInfo{ID: id}
 					latest = append(latest, d)
+					created = true
 				}
+				prevOffline := d.Offline
 				acts := make([]bool, len(states))
 				for i, s := range states {
 					if s == "1" {
@@ -901,8 +935,9 @@ func readGateway(conn net.Conn) {
 				d.Offline = false
 				d.LastSeen = time.Now()
 				mu.Unlock()
-				// atualizar TTY quando STAT/atuadores chegam
-				render()
+				if created || prevOffline {
+					render()
+				}
 			}
 		default:
 			// ignore other messages for now

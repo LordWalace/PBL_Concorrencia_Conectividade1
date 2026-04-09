@@ -284,7 +284,6 @@ func handleControlConn(conn net.Conn, deviceID *string) {
 		if cmd == "" {
 			continue
 		}
-		log.Printf("[CONTROL] Comando recebido para %s: %s (tamanho: %d bytes)", *deviceID, cmd, len(cmd))
 		// support multiple command syntaxes for compatibility
 		switch {
 		case cmd == "FAN_ON":
