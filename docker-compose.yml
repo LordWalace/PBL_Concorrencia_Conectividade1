@@ -1,26 +1,25 @@
 services:
   gateway:
     build: ./gateway
-    env_file: ./.env
     container_name: gateway
+    env_file: .env
     ports:
       - "8080:8080"
       - "8081:8081"
       - "8082:8082/udp"
     networks:
       - iot_net
+
   device:
     build: ./device
-    env_file: ./.env
-    ports:
-      - "8083:8083"
+    env_file: .env
+    # Nao mapeamos 'ports' aqui para evitar conflito na maquina fisica ao rodar multiplos devices
     networks:
       - iot_net
+
   client:
     build: ./client
-    env_file: ./.env
-    # no fixed container_name so multiple client/device instances can be created
-    # start services individually; do not auto-start gateway
+    env_file: .env
     stdin_open: true
     tty: true
     networks:
